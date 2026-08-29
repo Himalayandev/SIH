@@ -1,0 +1,15 @@
+[Unit]
+Description=Infinix Laptop ASR Server (TCP Port 8088 for ESP32)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/infinix_laptop_server
+ExecStart=/usr/bin/python3 /opt/infinix_laptop_server/server_faster_whisper.py
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

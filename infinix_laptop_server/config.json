@@ -1,0 +1,7 @@
+{
+  "tcp_port": 8088,
+  "whisper_model": "base.en",
+  "compute_type": "int8",
+  "cpu_threads": 4,
+  "log_level": "INFO"
+}
