@@ -298,11 +298,13 @@ def generate_dashboard():
         padding=(1, 2)
     )
 
-    # 3. Request Log Table
+    # 3. Request Log Table (Partitioned rows with horizontal dividers)
     table = Table(
         expand=True,
-        box=box.SIMPLE_HEAD,
+        box=box.HORIZONTALS,
+        show_lines=True,
         header_style=f"bold {TEXT_PRIMARY}",
+        border_style="grey35",
         padding=(0, 1)
     )
     
