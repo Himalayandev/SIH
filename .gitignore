@@ -10,6 +10,18 @@ __pycache__/
 .ipynb_checkpoints/
 .pytest_cache/
 
+# Compiled Binaries & Build outputs
+whisper_server
+*.o
+*.out
+*.exe
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Large Model weights (ggml binaries)
+*.bin
+
 # Dataset folders
 vikram_kws_dataset/
 vikram_split_dataset/
@@ -17,3 +29,4 @@ vikram_split_dataset/
 # Local text/config files
 .vscode/
 .idea/
+.DS_Store
