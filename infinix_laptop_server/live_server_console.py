@@ -151,8 +151,22 @@ def handle_client(client_sock, client_addr):
                 time.sleep(0.042)
                 transcribed_text = "Sample audio processed"
 
+        # Import ASTA Engine
+        try:
+            from asta_engine import ASTACommandValidator, MetricsCollector
+            HAS_ASTA = True
+        except ImportError:
+            HAS_ASTA = False
+
         t_asr_end = time.perf_counter()
         asr_compute_ms = int((t_asr_end - t_asr_start) * 1000)
+
+        if HAS_ASTA:
+            metrics = MetricsCollector.get_metrics(asr_latency_ms=asr_compute_ms, audio_dur_ms=audio_dur_ms)
+            asta_res = ASTACommandValidator.validate_and_repair(transcribed_text)
+        else:
+            metrics = {"cpu_workload_pct": 0}
+            asta_res = {"valid": False, "repaired_command": None, "was_repaired": False}
 
         if is_protocol:
             try:
@@ -163,14 +177,17 @@ def handle_client(client_sock, client_addr):
 
         timestamp = time.strftime("%H:%M:%S")
         lang_label = "Hindi 🇮🇳" if detected_lang == "hi" else ("English 🇬🇧" if detected_lang == "en" else detected_lang.upper())
+        repaired_cmd = asta_res["repaired_command"] if asta_res["valid"] else "(No IoT Action Match)"
 
         with lock:
             stats["total_requests"] += 1
             stats["last_client_ip"] = client_addr[0]
             stats["last_lang"] = lang_label
             stats["last_text"] = transcribed_text if transcribed_text else "(No speech detected)"
+            stats["last_cmd"] = repaired_cmd
             stats["last_duration_ms"] = audio_dur_ms
             stats["last_latency_ms"] = asr_compute_ms
+            stats["cpu_pct"] = metrics["cpu_workload_pct"]
 
             request_history.insert(0, {
                 "time": timestamp,
@@ -178,7 +195,8 @@ def handle_client(client_sock, client_addr):
                 "lang": lang_label,
                 "dur": f"{audio_dur_ms} ms",
                 "asr": f"{asr_compute_ms} ms",
-                "text": transcribed_text if transcribed_text else "(empty)"
+                "text": transcribed_text if transcribed_text else "(empty)",
+                "action": repaired_cmd
             })
             if len(request_history) > 8:
                 request_history.pop()
@@ -196,17 +214,18 @@ def generate_dashboard():
     uptime_sec = int(time.time() - stats["start_time"])
     local_ips = ", ".join(get_local_ips())
 
-    table = Table(title="📜 Recent Incoming Live Requests Log", expand=True, header_style="bold cyan")
+    table = Table(title="📜 Recent Incoming Live Requests & ASTA Actions Log", expand=True, header_style="bold cyan")
     table.add_column("Time", style="yellow", width=10)
     table.add_column("Client IP", style="magenta", width=16)
     table.add_column("Language", style="green", width=14)
     table.add_column("Duration", style="blue", width=10)
     table.add_column("ASR Latency", style="red", width=12)
+    table.add_column("ASTA Executable Command", style="bold green", width=22)
     table.add_column("Transcribed Text", style="bold white")
 
     with lock:
         for req in request_history:
-            table.add_row(req["time"], req["ip"], req["lang"], req["dur"], req["asr"], req["text"])
+            table.add_row(req["time"], req["ip"], req["lang"], req["dur"], req["asr"], req.get("action", req["text"]), req["text"])
 
     status_text = Text()
     status_text.append("🟢 SERVER STATUS: ONLINE & LISTENING\n", style="bold green")
