@@ -1,0 +1,6 @@
+[2026-08-30 02:37:22] ============================================================
+[2026-08-30 02:37:22] 🚀 [1/2] Loading Fast Offline Whisper ASR Engine...
+[2026-08-30 02:37:23] ✅ Model loaded: Faster-Whisper 'base.en' (INT8 Quantized, 4 threads)
+[2026-08-30 02:37:23] ============================================================
+[2026-08-30 02:37:23] 🟢 [INFINIX SERVER ONLINE] Listening on 0.0.0.0:8088 for clients...
+[2026-08-30 02:37:23] 📁 Live log file: C:\Users\himan\Desktop\New folder\SIH-main\infinix_laptop_server\server_live.log

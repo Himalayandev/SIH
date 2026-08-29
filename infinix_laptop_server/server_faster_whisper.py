@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 =============================================================================
-INFINIX LAPTOP SERVER - PYTHON REAL-TIME ASR & TELEMETRY ENGINE
-Uses faster-whisper (CTranslate2 INT8) with zero-delay raw TCP binary sockets
-Compatible with ESP32-S3, other PCs (tcp_edge_client.py), and mobile clients.
+INFINIX LAPTOP SERVER - REAL-TIME ASR & LIVE LOGGING ENGINE
+Features: Instant stdout flushing, persistent rolling file logs (server_live.log),
+Faster-Whisper (INT8 CPU) ASR, and zero-delay binary TCP sockets.
 =============================================================================
 """
 
@@ -24,7 +24,20 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-# Try importing faster_whisper, else fallback to simulation
+LOG_FILE_PATH = os.path.join(os.path.dirname(__file__), "server_live.log")
+
+def log_msg(msg: str):
+    timestamp = time.strftime("[%Y-%m-%d %H:%M:%S]")
+    formatted_msg = f"{timestamp} {msg}"
+    print(formatted_msg, flush=True)
+    try:
+        with open(LOG_FILE_PATH, "a", encoding="utf-8") as f:
+            f.write(formatted_msg + "\n")
+            f.flush()
+    except Exception:
+        pass
+
+# Try importing faster_whisper
 try:
     from faster_whisper import WhisperModel
     HAS_FASTER_WHISPER = True
@@ -47,7 +60,7 @@ if os.path.exists(CONFIG_PATH):
             COMPUTE_TYPE = cfg.get("compute_type", COMPUTE_TYPE)
             CPU_THREADS = cfg.get("cpu_threads", CPU_THREADS)
     except Exception as e:
-        print(f"⚠️ Failed to parse config.json: {e}")
+        log_msg(f"⚠️ Failed to parse config.json: {e}")
 
 # Protocol Constants
 PROTOCOL_SYN = 0x01
@@ -55,28 +68,27 @@ PROTOCOL_SYN_ACK = 0x06
 PROTOCOL_STREAM_END = 0xFF
 PROTOCOL_TRANSIT_ACK = 0x7F
 
-# Load Whisper Model (CTranslate2 INT8 quantization on CPU)
-print("=" * 60)
-print("🚀 [1/2] Loading Fast Offline Whisper ASR Engine...")
+log_msg("=" * 60)
+log_msg("🚀 [1/2] Loading Fast Offline Whisper ASR Engine...")
 if HAS_FASTER_WHISPER:
     whisper_engine = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type=COMPUTE_TYPE, cpu_threads=CPU_THREADS)
-    print(f"✅ Model loaded: Faster-Whisper '{WHISPER_MODEL_NAME}' ({COMPUTE_TYPE.upper()} Quantized, {CPU_THREADS} threads)")
+    log_msg(f"✅ Model loaded: Faster-Whisper '{WHISPER_MODEL_NAME}' ({COMPUTE_TYPE.upper()} Quantized, {CPU_THREADS} threads)")
 else:
     whisper_engine = None
-    print("⚠️ faster-whisper not installed. Running in high-speed simulation mode.")
-    print("   Run: pip install faster-whisper")
-print("=" * 60)
+    log_msg("⚠️ faster-whisper not installed. Running in high-speed simulation mode.")
+log_msg("=" * 60)
 
 def handle_esp32_connection(client_sock, client_addr):
-    # Disable Nagle's Algorithm for zero-delay writes
     client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     client_sock.settimeout(12.0)
     is_protocol_client = False
 
+    log_msg(f"⚡ [INCOMING CONNECT] Connection initiated from IP: {client_addr[0]}:{client_addr[1]}")
+
     try:
-        # Read initial byte to inspect handshake
         first_byte = client_sock.recv(1)
         if not first_byte:
+            log_msg(f"⚠️ [DISCONNECT] {client_addr[0]} closed socket without data.")
             client_sock.close()
             return
 
@@ -85,12 +97,12 @@ def handle_esp32_connection(client_sock, client_addr):
         if first_byte[0] == PROTOCOL_SYN:
             is_protocol_client = True
             client_sock.sendall(bytes([PROTOCOL_SYN_ACK]))
-            print(f"\n⚡ [STREAM INITIATED] Protocol Handshake ACK (0x06) sent to {client_addr[0]}")
+            log_msg(f"🤝 [HANDSHAKE] Binary SYN 0x01 verified. Sent SYN-ACK 0x06 to {client_addr[0]}")
         else:
-            print(f"\n⚡ [STREAM INITIATED] Direct Raw Audio Client Connected ({client_addr[0]}). Receiving PCM16...")
+            log_msg(f"🎙️ [RAW STREAM] Direct audio stream started from {client_addr[0]}")
             pcm_chunks.append(first_byte)
 
-        # Ingest audio chunks
+        # Ingest remaining audio data
         while True:
             try:
                 chunk = client_sock.recv(1024)
@@ -100,24 +112,26 @@ def handle_esp32_connection(client_sock, client_addr):
                 if is_protocol_client:
                     if chunk == bytes([PROTOCOL_STREAM_END]):
                         client_sock.sendall(bytes([PROTOCOL_TRANSIT_ACK]))
-                        print("🚀 [TRANSIT ACK] 0x7F sent to client instantly.")
+                        log_msg(f"🚀 [TRANSIT ACK] Sent 0x7F instant hardware ACK to {client_addr[0]}")
                         break
                     elif len(chunk) > 1 and chunk[-1] == PROTOCOL_STREAM_END:
                         pcm_chunks.append(chunk[:-1])
                         client_sock.sendall(bytes([PROTOCOL_TRANSIT_ACK]))
-                        print("🚀 [TRANSIT ACK] 0x7F sent to client instantly.")
+                        log_msg(f"🚀 [TRANSIT ACK] Sent 0x7F instant hardware ACK to {client_addr[0]}")
                         break
 
                 pcm_chunks.append(chunk)
             except socket.timeout:
+                log_msg(f"⏱️ [STREAM TIMEOUT] Stopped reading from {client_addr[0]} (Timeout)")
                 break
             except Exception:
                 break
 
         raw_bytes = b"".join(pcm_chunks)
-        audio_dur_ms = int(len(raw_bytes) / 32)  # 16000 samples/sec * 2 bytes = 32 bytes/ms
+        audio_dur_ms = int(len(raw_bytes) / 32)
+        log_msg(f"📥 [AUDIO RECEIVED] Total bytes: {len(raw_bytes)} ({audio_dur_ms} ms) from {client_addr[0]}")
 
-        # Transcribe using Whisper (Hindi & English Multilingual Auto-Detect)
+        # Transcribe with Faster-Whisper
         t_asr_start = time.perf_counter()
         transcribed_text = ""
         detected_lang = "en"
@@ -130,12 +144,11 @@ def handle_esp32_connection(client_sock, client_addr):
                 detected_lang = getattr(info, 'language', 'en')
             else:
                 time.sleep(0.042)
-                transcribed_text = "activate turn on the lights"
+                transcribed_text = "Sample audio processed"
 
         t_asr_end = time.perf_counter()
         asr_compute_ms = int((t_asr_end - t_asr_start) * 1000)
 
-        # Send 16-byte telemetry struct if protocol client
         if is_protocol_client:
             try:
                 telemetry_payload = struct.pack("<IIII", audio_dur_ms, 0, 0, asr_compute_ms)
@@ -145,18 +158,10 @@ def handle_esp32_connection(client_sock, client_addr):
 
         lang_label = "Hindi 🇮🇳" if detected_lang == "hi" else ("English 🇬🇧" if detected_lang == "en" else detected_lang.upper())
 
-        print("\n" + "┌" + "─" * 56 + "┐")
-        print("│            📊 PROFESSIONAL METRICS LOG (SERVER)           │")
-        print("├" + "─" * 56 + "┤")
-        print(f"│ • Client Address     : {client_addr[0]:<34} │")
-        print(f"│ • Language Detected  : {lang_label:<34} │")
-        print(f"│ • Audio Duration     : {audio_dur_ms:6d} ms                           │")
-        print(f"│ • ASR Inference Time : {asr_compute_ms:6d} ms                           │")
-        print(f"│ • Live Transcription : \"{transcribed_text[:30]:<30}\" │")
-        print("└" + "─" * 56 + "┘\n")
+        log_msg(f"✅ [STT COMPLETED] Client: {client_addr[0]} | Lang: {lang_label} | Audio: {audio_dur_ms}ms | ASR Latency: {asr_compute_ms}ms | Text: \"{transcribed_text}\"")
 
     except Exception as e:
-        print(f"[-] Error processing stream from {client_addr[0]}: {e}")
+        log_msg(f"❌ [ERROR] Client {client_addr[0]}: {e}")
     finally:
         try:
             client_sock.close()
@@ -169,7 +174,8 @@ def main():
     server.bind(("0.0.0.0", TCP_SERVER_PORT))
     server.listen(10)
 
-    print(f"🟢 [INFINIX SERVER ONLINE] Listening on 0.0.0.0:{TCP_SERVER_PORT} for clients...")
+    log_msg(f"🟢 [INFINIX SERVER ONLINE] Listening on 0.0.0.0:{TCP_SERVER_PORT} for clients...")
+    log_msg(f"📁 Live log file: {LOG_FILE_PATH}")
 
     try:
         while True:
@@ -177,7 +183,7 @@ def main():
             t = threading.Thread(target=handle_esp32_connection, args=(client_sock, client_addr), daemon=True)
             t.start()
     except KeyboardInterrupt:
-        print("\n[INFO] Server shutting down cleanly.")
+        log_msg("\n[INFO] Server shutting down cleanly.")
     finally:
         server.close()
 
