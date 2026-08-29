@@ -1,0 +1,32 @@
+# Virtual environments
+sih_env/
+sih_e/
+
+# Python cache and temporary files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Compiled Binaries & Build outputs
+whisper_server
+*.o
+*.out
+*.exe
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Large Model weights (ggml binaries)
+*.bin
+
+# Dataset folders
+vikram_kws_dataset/
+vikram_split_dataset/
+
+# Local text/config files
+.vscode/
+.idea/
+.DS_Store
