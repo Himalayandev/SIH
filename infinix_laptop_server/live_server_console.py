@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 =============================================================================
-INFINIX LAPTOP SERVER - LIVE DASHBOARD & REQUEST MONITOR
-Real-time console dashboard for tracking incoming ASR requests from ESP32 / PCs.
+INFINIX ASR LAPTOP SERVER - MINIMALIST SECURITY/DEVELOPER TUI DASHBOARD
+Subdued, high-end monochromatic aesthetic with icy cyan borders, rounded
+geometry, strict alignment, and functional alerts.
 =============================================================================
 """
 
@@ -24,6 +25,7 @@ if sys.platform == "win32":
         pass
 
 try:
+    from rich import box
     from rich.console import Console
     from rich.panel import Panel
     from rich.table import Table
@@ -43,7 +45,7 @@ except ImportError:
 # Configuration
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 TCP_SERVER_PORT = 8088
-WHISPER_MODEL_NAME = "base"
+WHISPER_MODEL_NAME = "small"
 COMPUTE_TYPE = "int8"
 CPU_THREADS = 4
 
@@ -63,14 +65,23 @@ PROTOCOL_SYN_ACK = 0x06
 PROTOCOL_STREAM_END = 0xFF
 PROTOCOL_TRANSIT_ACK = 0x7F
 
+# Styling Constants (Minimalist Monochromatic Palette)
+BORDER_COLOR = "steel_blue"       # Muted icy cyan / steel blue border accent
+TEXT_PRIMARY = "#cccccc"         # Soft ash gray primary text
+TEXT_SUBDUED = "#888888"         # Muted label text
+ALERT_RUST = "#cc5555"           # Muted rust / dark red for high latency / high CPU load
+STATUS_GREEN = "#55aa55"         # Dim, soft green for ONLINE status dot ONLY
+
 # Global State
 stats = {
     "total_requests": 0,
     "last_client_ip": "None",
     "last_lang": "None",
-    "last_text": "Waiting for requests...",
+    "last_text": "Waiting for incoming streams...",
+    "last_cmd": "None",
     "last_duration_ms": 0,
     "last_latency_ms": 0,
+    "cpu_pct": 0.0,
     "start_time": time.time(),
 }
 request_history = []
@@ -143,15 +154,28 @@ def handle_client(client_sock, client_addr):
 
         if len(raw_bytes) > 0:
             audio_np = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            
+            # Peak normalization
+            max_peak = np.max(np.abs(audio_np))
+            if max_peak > 0.001:
+                audio_np = audio_np / max_peak
+
             if whisper_engine:
-                segments, info = whisper_engine.transcribe(audio_np, beam_size=1)
+                segments, info = whisper_engine.transcribe(
+                    audio_np,
+                    beam_size=5,
+                    best_of=5,
+                    vad_filter=True,
+                    vad_parameters=dict(min_silence_duration_ms=400),
+                    initial_prompt="Hindi and English smart assistant commands: turn on light, fan, switch, activate, namaste."
+                )
                 transcribed_text = " ".join([seg.text for seg in segments]).strip()
                 detected_lang = getattr(info, 'language', 'en')
             else:
                 time.sleep(0.042)
-                transcribed_text = "Sample audio processed"
+                transcribed_text = "Sample audio stream"
 
-        # Import ASTA Engine
+        # ASTA Engine Processing
         try:
             from asta_engine import ASTACommandValidator, MetricsCollector
             HAS_ASTA = True
@@ -165,7 +189,7 @@ def handle_client(client_sock, client_addr):
             metrics = MetricsCollector.get_metrics(asr_latency_ms=asr_compute_ms, audio_dur_ms=audio_dur_ms)
             asta_res = ASTACommandValidator.validate_and_repair(transcribed_text)
         else:
-            metrics = {"cpu_workload_pct": 0}
+            metrics = {"cpu_workload_pct": 0.0}
             asta_res = {"valid": False, "repaired_command": None, "was_repaired": False}
 
         if is_protocol:
@@ -176,14 +200,14 @@ def handle_client(client_sock, client_addr):
                 pass
 
         timestamp = time.strftime("%H:%M:%S")
-        lang_label = "Hindi 🇮🇳" if detected_lang == "hi" else ("English 🇬🇧" if detected_lang == "en" else detected_lang.upper())
-        repaired_cmd = asta_res["repaired_command"] if asta_res["valid"] else "(No IoT Action Match)"
+        lang_label = "Hindi (hi)" if detected_lang == "hi" else ("English (en)" if detected_lang == "en" else detected_lang.upper())
+        repaired_cmd = asta_res["repaired_command"] if asta_res["valid"] else "-"
 
         with lock:
             stats["total_requests"] += 1
             stats["last_client_ip"] = client_addr[0]
             stats["last_lang"] = lang_label
-            stats["last_text"] = transcribed_text if transcribed_text else "(No speech detected)"
+            stats["last_text"] = transcribed_text if transcribed_text else "(empty)"
             stats["last_cmd"] = repaired_cmd
             stats["last_duration_ms"] = audio_dur_ms
             stats["last_latency_ms"] = asr_compute_ms
@@ -193,15 +217,16 @@ def handle_client(client_sock, client_addr):
                 "time": timestamp,
                 "ip": client_addr[0],
                 "lang": lang_label,
-                "dur": f"{audio_dur_ms} ms",
-                "asr": f"{asr_compute_ms} ms",
-                "text": transcribed_text if transcribed_text else "(empty)",
-                "action": repaired_cmd
+                "dur_ms": audio_dur_ms,
+                "asr_ms": asr_compute_ms,
+                "cpu_pct": metrics["cpu_workload_pct"],
+                "action": repaired_cmd,
+                "text": transcribed_text if transcribed_text else "(empty)"
             })
-            if len(request_history) > 8:
+            if len(request_history) > 10:
                 request_history.pop()
 
-    except Exception as e:
+    except Exception:
         pass
     finally:
         try:
@@ -210,45 +235,118 @@ def handle_client(client_sock, client_addr):
             pass
 
 def generate_dashboard():
-    console = Console()
     uptime_sec = int(time.time() - stats["start_time"])
     local_ips = ", ".join(get_local_ips())
 
-    table = Table(title="📜 Recent Incoming Live Requests & ASTA Actions Log", expand=True, header_style="bold cyan")
-    table.add_column("Time", style="yellow", width=10)
-    table.add_column("Client IP", style="magenta", width=16)
-    table.add_column("Language", style="green", width=14)
-    table.add_column("Duration", style="blue", width=10)
-    table.add_column("ASR Latency", style="red", width=12)
-    table.add_column("ASTA Executable Command", style="bold green", width=22)
-    table.add_column("Transcribed Text", style="bold white")
+    # 1. System Status Panel
+    status_text = Text()
+    status_text.append("● ", style=STATUS_GREEN)
+    status_text.append("ONLINE & LISTENING\n", style=f"bold {TEXT_PRIMARY}")
+    
+    status_text.append("Port           : ", style=TEXT_SUBDUED)
+    status_text.append(f"{TCP_SERVER_PORT}\n", style=TEXT_PRIMARY)
+    
+    status_text.append("Server IP      : ", style=TEXT_SUBDUED)
+    status_text.append(f"{local_ips}\n", style=TEXT_PRIMARY)
+    
+    status_text.append("Total Requests : ", style=TEXT_SUBDUED)
+    status_text.append(f"{stats['total_requests']}\n", style=TEXT_PRIMARY)
+    
+    status_text.append("System Load    : ", style=TEXT_SUBDUED)
+    cpu_val_style = ALERT_RUST if stats['cpu_pct'] > 80.0 else TEXT_PRIMARY
+    status_text.append(f"{stats['cpu_pct']:.1f}%\n", style=cpu_val_style)
+    
+    status_text.append("ASR Engine     : ", style=TEXT_SUBDUED)
+    status_text.append(f"Faster-Whisper '{WHISPER_MODEL_NAME}' (INT8 CPU)", style=TEXT_PRIMARY)
+
+    panel_status = Panel(
+        status_text,
+        title=" SYSTEM STATUS ",
+        title_align="left",
+        border_style=BORDER_COLOR,
+        box=box.ROUNDED,
+        padding=(1, 2)
+    )
+
+    # 2. Latest Request Metrics Panel
+    metrics_text = Text()
+    metrics_text.append("Client IP      : ", style=TEXT_SUBDUED)
+    metrics_text.append(f"{stats['last_client_ip']}\n", style=TEXT_PRIMARY)
+    
+    metrics_text.append("Language       : ", style=TEXT_SUBDUED)
+    metrics_text.append(f"{stats['last_lang']}\n", style=TEXT_PRIMARY)
+    
+    metrics_text.append("Audio Duration : ", style=TEXT_SUBDUED)
+    metrics_text.append(f"{stats['last_duration_ms']} ms\n", style=TEXT_PRIMARY)
+    
+    metrics_text.append("ASR Compute    : ", style=TEXT_SUBDUED)
+    latency_style = ALERT_RUST if stats['last_latency_ms'] > 1000 else TEXT_PRIMARY
+    metrics_text.append(f"{stats['last_latency_ms']} ms\n\n", style=latency_style)
+    
+    metrics_text.append("ASTA Action    : ", style=TEXT_SUBDUED)
+    metrics_text.append(f"{stats['last_cmd']}\n", style=f"bold {TEXT_PRIMARY}")
+    
+    metrics_text.append("Speech Output  : ", style=TEXT_SUBDUED)
+    metrics_text.append(f"\"{stats['last_text']}\"", style=TEXT_PRIMARY)
+
+    panel_metrics = Panel(
+        metrics_text,
+        title=" LATEST REQUEST METRICS ",
+        title_align="left",
+        border_style=BORDER_COLOR,
+        box=box.ROUNDED,
+        padding=(1, 2)
+    )
+
+    # 3. Request Log Table
+    table = Table(
+        expand=True,
+        box=box.SIMPLE_HEAD,
+        header_style=f"bold {TEXT_PRIMARY}",
+        padding=(0, 1)
+    )
+    
+    table.add_column("Time", justify="left", style=TEXT_PRIMARY, width=10)
+    table.add_column("Client IP", justify="left", style=TEXT_PRIMARY, width=16)
+    table.add_column("Language", justify="left", style=TEXT_PRIMARY, width=14)
+    table.add_column("Duration", justify="right", style=TEXT_PRIMARY, width=10)
+    table.add_column("ASR Latency", justify="right", width=12)
+    table.add_column("ASTA Action", justify="left", style=TEXT_PRIMARY, width=22)
+    table.add_column("Transcribed Text", justify="left", style=TEXT_PRIMARY, no_wrap=True, overflow="ellipsis")
 
     with lock:
         for req in request_history:
-            table.add_row(req["time"], req["ip"], req["lang"], req["dur"], req["asr"], req.get("action", req["text"]), req["text"])
+            lat_style = ALERT_RUST if req["asr_ms"] > 1000 else TEXT_PRIMARY
+            lat_text = Text(f"{req['asr_ms']} ms", style=lat_style)
+            
+            table.add_row(
+                req["time"],
+                req["ip"],
+                req["lang"],
+                f"{req['dur_ms']} ms",
+                lat_text,
+                req["action"],
+                req["text"]
+            )
 
-    status_text = Text()
-    status_text.append("🟢 SERVER STATUS: ONLINE & LISTENING\n", style="bold green")
-    status_text.append(f"• Listening Port : {TCP_SERVER_PORT}\n", style="bold white")
-    status_text.append(f"• Server IP      : {local_ips}\n", style="bold yellow")
-    status_text.append(f"• Total Requests : {stats['total_requests']}\n", style="bold cyan")
-    status_text.append(f"• Server Uptime  : {uptime_sec} seconds\n", style="bold magenta")
-    status_text.append(f"• STT Engine     : Faster-Whisper '{WHISPER_MODEL_NAME}' (INT8 CPU)", style="bold blue")
-
-    last_req_text = Text()
-    last_req_text.append("⚡ LATEST REQUEST METRICS:\n", style="bold yellow")
-    last_req_text.append(f"• Last Client IP  : {stats['last_client_ip']}\n", style="white")
-    last_req_text.append(f"• Language        : {stats['last_lang']}\n", style="white")
-    last_req_text.append(f"• Audio Duration  : {stats['last_duration_ms']} ms\n", style="white")
-    last_req_text.append(f"• Inference Time  : {stats['last_latency_ms']} ms\n\n", style="white")
-    last_req_text.append("📝 TRANSCRIPTION:\n", style="bold green")
-    last_req_text.append(f"\"{stats['last_text']}\"", style="bold italic white")
+    panel_table = Panel(
+        table,
+        title=" INCOMING REQUESTS LOG ",
+        title_align="left",
+        border_style=BORDER_COLOR,
+        box=box.ROUNDED,
+        padding=(1, 2)
+    )
 
     layout = Layout()
     layout.split_column(
-        Layout(Panel(status_text, title="🚀 INFINIX LAPTOP ASR LIVE SERVER DASHBOARD", border_style="bright_blue"), size=9),
-        Layout(Panel(last_req_text, title="🎯 LIVE REAL-TIME REQUEST TRACKER", border_style="bright_yellow"), size=9),
-        Layout(Panel(table, border_style="green"))
+        Layout(name="top_panels", size=10),
+        Layout(panel_table, name="bottom_table")
+    )
+    
+    layout["top_panels"].split_row(
+        Layout(panel_status, ratio=1),
+        Layout(panel_metrics, ratio=1)
     )
 
     return layout
@@ -259,7 +357,6 @@ def main():
     server.bind(("0.0.0.0", TCP_SERVER_PORT))
     server.listen(10)
 
-    # Server Thread
     def listen_loop():
         while True:
             try:
@@ -280,9 +377,9 @@ def main():
                     time.sleep(0.25)
                     live.update(generate_dashboard())
             except KeyboardInterrupt:
-                print("\n[INFO] Dashboard stopped.")
+                pass
     else:
-        print(f"🟢 Server listening on 0.0.0.0:{TCP_SERVER_PORT}...")
+        print(f"Server listening on 0.0.0.0:{TCP_SERVER_PORT}...")
         try:
             while True:
                 time.sleep(1.0)
