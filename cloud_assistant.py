@@ -1,25 +1,32 @@
+#!/usr/bin/env python3
+"""
+=============================================================================
+LOCAL MULTILINGUAL ASSISTANT (100% OFFLINE - FASTER-WHISPER)
+• Isolates Deepgram cloud dependency -> Uses local Faster-Whisper (INT8 CPU)
+• Supports Real-Time Multilingual STT: Hindi (हिंदी) & English (Hinglish)
+• Local Wake-Word Engine ("Activate" TFLite INT8 model)
+=============================================================================
+"""
+
 import os
 import sys
 import time
-import asyncio
 import numpy as np
 import sounddevice as sd
 import librosa
 import tensorflow as tf
-from deepgram import AsyncDeepgramClient
-from deepgram.core.events import EventType
+from faster_whisper import WhisperModel
 
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
     except Exception:
         pass
 
 # ---------------------------------------------------------------------------
-# Configuration (Matches your folder's res8_activate_int8.tflite)
+# Configuration (Matches res8_activate_int8.tflite)
 # ---------------------------------------------------------------------------
-DEEPGRAM_API_KEY = "0756cb24de452681cd05b321d97b100248b0a327"  # <-- Apni Deepgram API key yahan dalein
-
 MODEL_PATH = "res8_activate_int8.tflite"
 CLASSES = ["background", "unknown", "activate"]
 ACTIVATE_IDX = CLASSES.index("activate")
@@ -37,9 +44,10 @@ ACTIVATE_THRESHOLD = 0.65
 VAD_RMS_THRESHOLD = 0.005
 
 # ---------------------------------------------------------------------------
-# Load INT8 Model
+# 1. Load Local Wake-Word INT8 TFLite Model
 # ---------------------------------------------------------------------------
-print("\n[1/2] Loading Local Wake-Word Model...")
+print("\n" + "=" * 60)
+print("🚀 [1/2] Loading Local Wake-Word Model ('Activate')...")
 interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
 interpreter.allocate_tensors()
 in_idx = interpreter.get_input_details()[0]['index']
@@ -48,6 +56,16 @@ in_scale, in_zero_point = interpreter.get_input_details()[0]['quantization']
 out_scale, out_zero_point = interpreter.get_output_details()[0]['quantization']
 
 audio_buffer = np.zeros(TARGET_SAMPLES, dtype=np.float32)
+
+# ---------------------------------------------------------------------------
+# 2. Load Local Faster-Whisper ASR Engine (INT8 Multilingual: Hindi & English)
+# ---------------------------------------------------------------------------
+print("🚀 [2/2] Loading Offline Faster-Whisper ASR Engine (Hindi + English)...")
+# 'base' or 'small' multilingual model for fast INT8 CPU inference
+WHISPER_MODEL_SIZE = "base"
+whisper_engine = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8", cpu_threads=4)
+print(f"✅ Offline ASR Engine Ready: Faster-Whisper '{WHISPER_MODEL_SIZE}' (INT8 Quantized)")
+print("=" * 60)
 
 def extract_features(audio: np.ndarray) -> np.ndarray:
     if len(audio) < TARGET_SAMPLES:
@@ -76,93 +94,77 @@ def audio_callback(indata, frames, time_info, status):
     audio_buffer[-frames:] = indata[:, 0]
 
 # ---------------------------------------------------------------------------
-# Cloud WebSocket Streaming ASR Session
+# 3. Offline STT Processing (Hindi & English Support)
 # ---------------------------------------------------------------------------
-async def run_cloud_asr(silence_limit_sec=1.8, max_speech_sec=8.0):
-    print("\n" + "—"*55)
-    print("🌐 [CLOUD STREAM ACTIVE] Bolna shuru kijiye...")
-    print("—"*55)
+def run_offline_asr(silence_limit_sec=1.5, max_speech_sec=8.0):
+    print("\n" + "—" * 60)
+    print("🎙️ [OFFLINE RECORDING ACTIVE] Bolna shuru kijiye (Hindi/English)...")
+    print("—" * 60)
 
-    deepgram = AsyncDeepgramClient(api_key=DEEPGRAM_API_KEY)
+    chunk_size = int(SAMPLE_RATE * 0.1)  # 100ms chunks
+    recorded_chunks = []
+    silent_chunks = 0
+    max_silent_chunks = int(silence_limit_sec / 0.1)
+    start_time = time.time()
 
-    transcription_result = []
-    is_speaking = True
+    with sd.InputStream(channels=1, samplerate=SAMPLE_RATE, dtype='int16', blocksize=chunk_size) as mic:
+        while True:
+            data, _ = mic.read(chunk_size)
+            recorded_chunks.append(data.copy())
 
-    async def on_message(result, **kwargs):
-        if not hasattr(result, "channel"):
-            return
-        sentence = result.channel.alternatives[0].transcript
-        if len(sentence) > 0:
-            print(f"\r⚡ Live Text: {sentence}", end="", flush=True)
-            if result.is_final:
-                transcription_result.append(sentence)
+            # Energy check for silence exit
+            rms = np.sqrt(np.mean((data.astype(np.float32) / 32768.0) ** 2))
+            if rms < 0.008:
+                silent_chunks += 1
+            else:
+                silent_chunks = 0
 
-    # Use the SDK v7 async context manager
-    async with deepgram.listen.v1.connect(
-        model="nova-2",
-        language="en-IN",
-        smart_format=True,
-        encoding="linear16",
-        channels=1,
-        sample_rate=SAMPLE_RATE,
-        interim_results=True,
-        endpointing=300
-    ) as dg_connection:
+            elapsed = time.time() - start_time
+            if (silent_chunks >= max_silent_chunks and elapsed > 1.0) or (elapsed > max_speech_sec):
+                print("\n🛑 [RECORDING FINISHED] Processing speech locally...")
+                break
 
-        dg_connection.on(EventType.MESSAGE, on_message)
+    # Convert recorded audio chunks to normalized float32 buffer
+    raw_bytes = b"".join([c.tobytes() for c in recorded_chunks])
+    if len(raw_bytes) == 0:
+        return "", "unknown", 0.0
 
-        # Start the background task to listen for messages
-        listen_task = asyncio.create_task(dg_connection.start_listening())
+    audio_np = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    audio_dur_sec = len(audio_np) / SAMPLE_RATE
 
-        chunk_size = int(SAMPLE_RATE * 0.1)  # 100ms streaming chunks
-        silent_chunks = 0
-        max_silent_chunks = int(silence_limit_sec / 0.1)
-        start_time = time.time()
+    # Transcribe with Faster-Whisper (auto-detect Hindi / English)
+    t_asr_start = time.perf_counter()
+    segments, info = whisper_engine.transcribe(
+        audio_np,
+        beam_size=1,
+        best_of=1,
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=500)
+    )
+    transcription = " ".join([seg.text for seg in segments]).strip()
+    t_asr_end = time.perf_counter()
 
-        with sd.InputStream(channels=1, samplerate=SAMPLE_RATE, dtype='int16', blocksize=chunk_size) as mic:
-            while is_speaking:
-                data, _ = mic.read(chunk_size)
-                await dg_connection.send_media(data.tobytes())
+    asr_latency_ms = (t_asr_end - t_asr_start) * 1000
+    detected_lang = info.language
+    lang_probability = info.language_probability * 100
 
-                # Energy check for silence exit
-                rms = np.sqrt(np.mean((data.astype(np.float32) / 32768.0)**2))
-                if rms < 0.008:
-                    silent_chunks += 1
-                else:
-                    silent_chunks = 0
-
-                if (silent_chunks >= max_silent_chunks and (time.time() - start_time) > 1.2) or (time.time() - start_time > max_speech_sec):
-                    print("\n🛑 [STOP] Silence detected, closing stream...")
-                    is_speaking = False
-
-                await asyncio.sleep(0.01)
-
-        # Finalize the WebSocket connection and close nicely
-        await dg_connection.send_finalize()
-        await asyncio.sleep(0.5)
-
-        listen_task.cancel()
-        try:
-            await listen_task
-        except asyncio.CancelledError:
-            pass
-
-    return " ".join(transcription_result).strip()
+    return transcription, detected_lang, lang_probability, asr_latency_ms, audio_dur_sec
 
 # ---------------------------------------------------------------------------
 # Main Execution Loop
 # ---------------------------------------------------------------------------
 def main():
     step_size = int(SAMPLE_RATE * 0.06)
-    print("\n" + "="*55)
-    print("🟢 SYSTEM READY: Listening for 'Activate'...")
-    print("="*55)
+    print("\n" + "=" * 60)
+    print("🟢 SYSTEM READY: Local Wake-Word & Faster-Whisper STT Active!")
+    print("   Say 'Activate' to trigger speech recognition.")
+    print("=" * 60)
 
     try:
         while True:
             with sd.InputStream(channels=1, samplerate=SAMPLE_RATE, blocksize=step_size, callback=audio_callback):
                 while True:
-                    rms = np.sqrt(np.mean(audio_buffer**2))
+                    rms = np.sqrt(np.mean(audio_buffer ** 2))
                     if rms < VAD_RMS_THRESHOLD:
                         time.sleep(0.03)
                         continue
@@ -180,24 +182,35 @@ def main():
                     probs = (out.astype(np.float32) - out_zero_point) * out_scale if out_scale > 0 else out
                     act_prob = probs[0][ACTIVATE_IDX]
                     bar = "█" * int(act_prob * 15)
-                    print(f"\r[LOCAL LISTEN] 'Activate': [{bar:<15}] {act_prob*100:4.1f}%", end="")
+                    print(f"\r[LOCAL LISTEN] 'Activate': [{bar:<15}] {act_prob * 100:4.1f}%", end="")
 
                     if act_prob >= ACTIVATE_THRESHOLD:
-                        print(f"\n⚡ 'Activate' Triggered ({act_prob*100:.1f}%)! Connecting to Cloud...")
+                        print(f"\n⚡ 'Activate' Triggered ({act_prob * 100:.1f}%)! Starting Local STT...")
                         break
 
                     time.sleep(0.02)
 
-            # ASR Stream start
-            command = asyncio.run(run_cloud_asr())
-            print(f"\n✅ COMMAND RECEIVED: \"{command}\"\n")
+            # Process STT locally using Faster-Whisper
+            text, lang, lang_prob, latency_ms, duration_sec = run_offline_asr()
+
+            lang_label = "Hindi 🇮🇳" if lang == "hi" else ("English 🇬🇧" if lang == "en" else f"{lang.upper()}")
+
+            print("\n" + "┌" + "─" * 58 + "┐")
+            print("│              📊 LOCAL FASTER-WHISPER RESULTS              │")
+            print("├" + "─" * 58 + "┤")
+            print(f"│ • Detected Language : {lang_label:<34} ({lang_prob:.1f}%) │")
+            print(f"│ • Audio Duration    : {duration_sec:<38.2f} sec │")
+            print(f"│ • ASR Compute Time  : {latency_ms:<38.2f} ms  │")
+            print("├" + "─" * 58 + "┤")
+            print(f"│ • Spoken Text       : \"{text}\"")
+            print("└" + "─" * 58 + "┘\n")
 
             # Reset buffer for next listening cycle
             audio_buffer.fill(0)
             time.sleep(1.0)
-            print("="*55)
-            print("🟢 Resuming Listening...")
-            print("="*55)
+            print("=" * 60)
+            print("🟢 Resuming Wake-Word Listening...")
+            print("=" * 60)
 
     except KeyboardInterrupt:
         print("\n[INFO] Stopped.")
