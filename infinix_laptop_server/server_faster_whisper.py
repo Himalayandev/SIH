@@ -6,11 +6,20 @@ Uses faster-whisper (CTranslate2 INT8) with zero-delay raw TCP binary sockets
 =============================================================================
 """
 
+import sys
 import socket
 import struct
 import time
 import threading
 import numpy as np
+
+# Ensure UTF-8 output encoding on Windows console to prevent UnicodeEncodeError with emojis/box chars
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 # Try importing faster_whisper, else fallback to standard Whisper or mock
 try:
@@ -42,6 +51,8 @@ print("=" * 60)
 def handle_esp32_connection(client_sock, client_addr):
     # Disable Nagle's Algorithm for zero-delay writes
     client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    # Set socket timeout to prevent hung threads if client disconnects abruptly
+    client_sock.settimeout(10.0)
 
     try:
         # 1. Read SYN handshake byte
@@ -63,9 +74,15 @@ def handle_esp32_connection(client_sock, client_addr):
             if not chunk:
                 break
 
-            # Check for single-byte stream terminator (0xFF)
-            if len(chunk) == 1 and chunk[0] == PROTOCOL_STREAM_END:
+            # Check for stream terminator (0xFF)
+            if chunk == bytes([PROTOCOL_STREAM_END]):
                 # INSTANT HARDWARE TRANSIT ACK (0x7F) SENT BEFORE ASR
+                client_sock.sendall(bytes([PROTOCOL_TRANSIT_ACK]))
+                print("🚀 [TRANSIT ACK] 0x7F sent to ESP32 instantly.")
+                break
+            elif len(chunk) > 1 and chunk[-1] == PROTOCOL_STREAM_END:
+                # Terminator coalesced with audio data
+                pcm_chunks.append(chunk[:-1])
                 client_sock.sendall(bytes([PROTOCOL_TRANSIT_ACK]))
                 print("🚀 [TRANSIT ACK] 0x7F sent to ESP32 instantly.")
                 break
