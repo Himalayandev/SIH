@@ -13,6 +13,13 @@ import struct
 import time
 import numpy as np
 
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 8088
 
