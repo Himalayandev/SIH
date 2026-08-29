@@ -28,8 +28,28 @@ try:
 except ImportError:
     HAS_FASTER_WHISPER = False
 
-# Protocol Constants
+import os
+import json
+
+# Load Config if present
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 TCP_SERVER_PORT = 8088
+WHISPER_MODEL_NAME = "base.en"
+COMPUTE_TYPE = "int8"
+CPU_THREADS = 4
+
+if os.path.exists(CONFIG_PATH):
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+            TCP_SERVER_PORT = cfg.get("tcp_port", TCP_SERVER_PORT)
+            WHISPER_MODEL_NAME = cfg.get("whisper_model", WHISPER_MODEL_NAME)
+            COMPUTE_TYPE = cfg.get("compute_type", COMPUTE_TYPE)
+            CPU_THREADS = cfg.get("cpu_threads", CPU_THREADS)
+    except Exception as e:
+        print(f"⚠️ Failed to parse config.json: {e}")
+
+# Protocol Constants
 PROTOCOL_SYN = 0x01
 PROTOCOL_SYN_ACK = 0x06
 PROTOCOL_STREAM_END = 0xFF
@@ -39,9 +59,8 @@ PROTOCOL_TRANSIT_ACK = 0x7F
 print("=" * 60)
 print("🚀 [1/2] Loading Fast Offline Whisper ASR Engine...")
 if HAS_FASTER_WHISPER:
-    # Use 'tiny.en' or 'base.en' on CPU with INT8 quantization for sub-50ms inference
-    whisper_engine = WhisperModel("base.en", device="cpu", compute_type="int8", cpu_threads=4)
-    print("✅ Model loaded: Faster-Whisper base.en (INT8 Quantized)")
+    whisper_engine = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type=COMPUTE_TYPE, cpu_threads=CPU_THREADS)
+    print(f"✅ Model loaded: Faster-Whisper {WHISPER_MODEL_NAME} ({COMPUTE_TYPE.upper()} Quantized, {CPU_THREADS} threads)")
 else:
     whisper_engine = None
     print("⚠️ faster-whisper not installed. Running in high-speed simulation mode.")
