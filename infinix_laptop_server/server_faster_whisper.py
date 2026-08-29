@@ -47,9 +47,10 @@ except ImportError:
 # Load Config if present
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 TCP_SERVER_PORT = 8088
-WHISPER_MODEL_NAME = "base"
+WHISPER_MODEL_NAME = "small"
 COMPUTE_TYPE = "int8"
 CPU_THREADS = 4
+BEAM_SIZE = 5
 
 if os.path.exists(CONFIG_PATH):
     try:
@@ -59,6 +60,7 @@ if os.path.exists(CONFIG_PATH):
             WHISPER_MODEL_NAME = cfg.get("whisper_model", WHISPER_MODEL_NAME)
             COMPUTE_TYPE = cfg.get("compute_type", COMPUTE_TYPE)
             CPU_THREADS = cfg.get("cpu_threads", CPU_THREADS)
+            BEAM_SIZE = cfg.get("beam_size", BEAM_SIZE)
     except Exception as e:
         log_msg(f"⚠️ Failed to parse config.json: {e}")
 
@@ -131,15 +133,29 @@ def handle_esp32_connection(client_sock, client_addr):
         audio_dur_ms = int(len(raw_bytes) / 32)
         log_msg(f"📥 [AUDIO RECEIVED] Total bytes: {len(raw_bytes)} ({audio_dur_ms} ms) from {client_addr[0]}")
 
-        # Transcribe with Faster-Whisper
+        # Transcribe with Faster-Whisper (Enhanced Audio Processing & Beam Search)
         t_asr_start = time.perf_counter()
         transcribed_text = ""
         detected_lang = "en"
 
         if len(raw_bytes) > 0:
             audio_np = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+            # 1. Peak Normalization (Boost low-volume mic inputs to prevent dropped words)
+            max_peak = np.max(np.abs(audio_np))
+            if max_peak > 0.001:
+                audio_np = audio_np / max_peak
+
             if whisper_engine:
-                segments, info = whisper_engine.transcribe(audio_np, beam_size=1)
+                # 2. Advanced High-Accuracy Beam Decoding & VAD Noise Filter
+                segments, info = whisper_engine.transcribe(
+                    audio_np,
+                    beam_size=BEAM_SIZE,
+                    best_of=BEAM_SIZE,
+                    vad_filter=True,
+                    vad_parameters=dict(min_silence_duration_ms=400),
+                    initial_prompt="Hindi and English smart assistant commands: turn on light, fan, switch, activate, namaste, kaise ho."
+                )
                 transcribed_text = " ".join([seg.text for seg in segments]).strip()
                 detected_lang = getattr(info, 'language', 'en')
             else:
