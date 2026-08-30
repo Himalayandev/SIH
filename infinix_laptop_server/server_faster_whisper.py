@@ -47,10 +47,10 @@ except ImportError:
 # Load Config if present
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 TCP_SERVER_PORT = 8088
-WHISPER_MODEL_NAME = "small"
+WHISPER_MODEL_NAME = "tiny.en"
 COMPUTE_TYPE = "int8"
 CPU_THREADS = 4
-BEAM_SIZE = 5
+BEAM_SIZE = 1
 
 if os.path.exists(CONFIG_PATH):
     try:
