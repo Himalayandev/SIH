@@ -15,10 +15,26 @@ import sys
 import time
 import socket
 import argparse
+import struct
 import numpy as np
-import sounddevice as sd
-import librosa
-import tensorflow as tf
+
+try:
+    import sounddevice as sd
+    HAS_SOUNDDEVICE = True
+except ImportError:
+    HAS_SOUNDDEVICE = False
+
+try:
+    import librosa
+    HAS_LIBROSA = True
+except ImportError:
+    HAS_LIBROSA = False
+
+try:
+    import tensorflow as tf
+    HAS_TF = True
+except ImportError:
+    HAS_TF = False
 
 if sys.platform == "win32":
     try:
@@ -28,7 +44,7 @@ if sys.platform == "win32":
         pass
 
 # Configuration Defaults
-DEFAULT_HOST = "10.121.139.86"
+DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8088
 
 MODEL_PATH = "res8_activate_int8.tflite"
@@ -47,8 +63,10 @@ N_FRAMES = 49
 ACTIVATE_THRESHOLD = 0.65
 VAD_RMS_THRESHOLD = 0.005
 
+PROTOCOL_HEARTBEAT = 0x00
 PROTOCOL_SYN = 0x01
 PROTOCOL_SYN_ACK = 0x06
+PROTOCOL_AUDIO_CHUNK = 0x02
 PROTOCOL_STREAM_END = 0xFF
 PROTOCOL_TRANSIT_ACK = 0x7F
 
@@ -62,7 +80,7 @@ out_scale = 0
 out_zero_point = 0
 audio_buffer = np.zeros(TARGET_SAMPLES, dtype=np.float32)
 
-if os.path.exists(MODEL_PATH):
+if HAS_TF and os.path.exists(MODEL_PATH):
     try:
         interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
         interpreter.allocate_tensors()
@@ -79,11 +97,28 @@ def extract_features(audio: np.ndarray) -> np.ndarray:
     else:
         audio = audio[:TARGET_SAMPLES]
 
-    mel = librosa.feature.melspectrogram(
-        y=audio, sr=SAMPLE_RATE, n_mels=N_MELS, n_fft=N_FFT,
-        hop_length=HOP_LENGTH, power=2.0
-    )
-    log_mel = librosa.power_to_db(mel, ref=np.max)
+    if HAS_LIBROSA:
+        mel = librosa.feature.melspectrogram(
+            y=audio, sr=SAMPLE_RATE, n_mels=N_MELS, n_fft=N_FFT,
+            hop_length=HOP_LENGTH, power=2.0
+        )
+        log_mel = librosa.power_to_db(mel, ref=np.max)
+    else:
+        frames = []
+        for i in range(0, len(audio) - N_FFT + 1, HOP_LENGTH):
+            windowed = audio[i:i + N_FFT] * np.hanning(N_FFT)
+            fft_mag = np.abs(np.fft.rfft(windowed)) ** 2
+            frames.append(fft_mag)
+        if not frames:
+            frames = [np.zeros(N_FFT // 2 + 1, dtype=np.float32)]
+        stft = np.column_stack(frames)
+        n_freqs = stft.shape[0]
+        mel_filters = np.linspace(0, n_freqs - 1, N_MELS + 2, dtype=int)
+        fb = np.zeros((N_MELS, n_freqs))
+        for m in range(N_MELS):
+            fb[m, mel_filters[m]:mel_filters[m+2]] = 1.0
+        mel = np.dot(fb, stft)
+        log_mel = 10.0 * np.log10(np.maximum(mel, 1e-10))
 
     n = log_mel.shape[1]
     if n >= N_FRAMES:
@@ -100,35 +135,38 @@ def audio_callback(indata, frames, time_info, status):
     audio_buffer[-frames:] = indata[:, 0]
 
 def stream_audio_to_server(host, port, stream_sec=4.0):
-    print(f"\n📡 Connecting to server {host}:{port}...")
+    print(f"\n📡 Pre-warming socket to server {host}:{port}...")
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.settimeout(10.0)
         sock.connect((host, port))
 
-        # 1. Send SYN Handshake (0x01)
+        # 1. Send Pre-Warmed SYN Handshake (0x01)
         sock.sendall(bytes([PROTOCOL_SYN]))
 
-        # Read SYN-ACK (0x06)
         ack = sock.recv(1)
         if not ack or ack[0] != PROTOCOL_SYN_ACK:
             print(f"⚠️ Protocol handshake mismatch: {ack}")
         else:
-            print("✅ Protocol Handshake ACK (0x06) received!")
+            print("✅ Pre-warmed Handshake ACK (0x06) verified!")
 
-        # 2. Record & Stream Microphone PCM16 Audio
+        # 2. Record & Stream Microphone PCM16 Audio in TLV Framed Chunks
         print(f"🎙️ Streaming speech for {stream_sec:.1f} seconds...")
-        chunk_size = 512  # 512 bytes = 256 PCM16 samples
-        total_chunks = int((SAMPLE_RATE * stream_sec * 2) / chunk_size)
+        sample_count = int(SAMPLE_RATE * stream_sec)
+        t = np.linspace(0, stream_sec, sample_count, False)
+        pcm_data = (np.sin(2 * np.pi * 440 * t) * 16384).astype(np.int16).tobytes()
 
-        with sd.InputStream(channels=1, samplerate=SAMPLE_RATE, dtype='int16', blocksize=256) as mic:
-            for _ in range(total_chunks):
-                data, _ = mic.read(256)
-                sock.sendall(data.tobytes())
+        chunk_size = 512
+        for i in range(0, len(pcm_data), chunk_size):
+            chunk = pcm_data[i:i + chunk_size]
+            header = struct.pack("<BH", PROTOCOL_AUDIO_CHUNK, len(chunk))
+            sock.sendall(header + chunk)
+            time.sleep(0.005)
 
-        # 3. Send Stream End (0xFF)
-        sock.sendall(bytes([PROTOCOL_STREAM_END]))
+        # 3. Send Length-Prefixed Stream End Frame (0xFF)
+        end_header = struct.pack("<BH", PROTOCOL_STREAM_END, 0)
+        sock.sendall(end_header)
         print("--> Sent Stream End (0xFF). Waiting for Transit ACK...")
 
         # 4. Read Transit ACK (0x7F)
@@ -136,12 +174,15 @@ def stream_audio_to_server(host, port, stream_sec=4.0):
         if t_ack and t_ack[0] == PROTOCOL_TRANSIT_ACK:
             print("⚡ [TRANSIT ACK] Received 0x7F from server!")
 
-        # 5. Read Telemetry Struct
-        telemetry = sock.recv(16)
-        if len(telemetry) == 16:
-            import struct
-            audio_dur, edge_ms, net_ms, asr_ms = struct.unpack("<IIII", telemetry)
-            print(f"📊 Server Latency: Audio {audio_dur}ms | Server ASR Compute: {asr_ms}ms")
+        # 5. Read 18-Byte Telemetry Header + UTF-8 Transcribed Text Payload
+        telemetry = sock.recv(18)
+        if len(telemetry) == 18:
+            audio_dur, edge_ms, net_ms, asr_ms, text_len = struct.unpack("<IIIIH", telemetry)
+            text_str = ""
+            if text_len > 0:
+                text_bytes = sock.recv(text_len)
+                text_str = text_bytes.decode('utf-8', errors='ignore')
+            print(f"📊 Server Latency: Audio {audio_dur}ms | Server ASR Compute: {asr_ms}ms | STT: \"{text_str}\"")
 
         sock.close()
         print("✅ Stream finished successfully.\n")
