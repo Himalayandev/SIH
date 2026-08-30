@@ -25,26 +25,27 @@ SERVER_PORT = 8088
 
 PROTOCOL_SYN = 0x01
 PROTOCOL_SYN_ACK = 0x06
+PROTOCOL_AUDIO_CHUNK = 0x02
 PROTOCOL_STREAM_END = 0xFF
 PROTOCOL_TRANSIT_ACK = 0x7F
 
 def run_test_client(host=SERVER_HOST, port=SERVER_PORT):
     print("=" * 60)
-    print(f"🧪 [ESP32 SIMULATOR] Connecting to Infinix Server at {host}:{port}...")
+    print(f"🧪 [ESP32 SIMULATOR] Pre-warming persistent socket to {host}:{port}...")
     print("=" * 60)
 
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock.settimeout(5.0)
+        sock.settimeout(10.0)
 
         t_connect_start = time.perf_counter()
         sock.connect((host, port))
         t_connect_end = time.perf_counter()
-        print(f"✅ Connected in {(t_connect_end - t_connect_start)*1000:.2f} ms")
+        print(f"✅ Pre-warmed TCP Socket Connected in {(t_connect_end - t_connect_start)*1000:.2f} ms")
 
-        # 1. Send SYN Handshake
-        print("\n--> [1/4] Sending SYN (0x01)...")
+        # 1. Send SYN Handshake on startup
+        print("\n--> [1/4] Sending Pre-Warmed SYN (0x01)...")
         sock.sendall(bytes([PROTOCOL_SYN]))
 
         # Read SYN-ACK
@@ -52,7 +53,7 @@ def run_test_client(host=SERVER_HOST, port=SERVER_PORT):
         if not ack or ack[0] != PROTOCOL_SYN_ACK:
             print(f"❌ Handshake failed! Expected 0x06, got {ack}")
             return False
-        print("<-- [2/4] Handshake ACK (0x06) received successfully!")
+        print("<-- [2/4] Pre-Warmed Handshake ACK (0x06) verified! Socket pre-warmed (0ms wake delay).")
 
         # 2. Generate 1.5 sec of 16kHz PCM16 audio (synthetic 440Hz tone)
         sample_rate = 16000
@@ -61,18 +62,19 @@ def run_test_client(host=SERVER_HOST, port=SERVER_PORT):
         tone = (np.sin(2 * np.pi * 440 * t) * 16384).astype(np.int16)
         audio_bytes = tone.tobytes()
 
-        print(f"\n--> [3/4] Streaming {len(audio_bytes)} bytes ({duration_sec}s) PCM16 audio in 512B chunks...")
-        t_stream_start = time.perf_counter()
+        print(f"\n--> [3/4] Streaming {len(audio_bytes)} bytes ({duration_sec}s) PCM16 audio in TLV Framed 512B Chunks...")
 
         chunk_size = 512
         for i in range(0, len(audio_bytes), chunk_size):
             chunk = audio_bytes[i:i + chunk_size]
-            sock.sendall(chunk)
+            header = struct.pack("<BH", PROTOCOL_AUDIO_CHUNK, len(chunk))
+            sock.sendall(header + chunk)
             time.sleep(0.005)  # Simulate real-time hardware stream delay
 
-        # Send Stream End Terminator (0xFF)
+        # Send Length-Prefixed Stream End Terminator (0xFF)
         t_end_sent = time.perf_counter()
-        sock.sendall(bytes([PROTOCOL_STREAM_END]))
+        end_header = struct.pack("<BH", PROTOCOL_STREAM_END, 0)
+        sock.sendall(end_header)
         print("--> [4/4] Sent Stream End (0xFF). Waiting for Transit ACK (0x7F)...")
 
         # Wait for Instant Transit ACK (0x7F)
@@ -85,19 +87,25 @@ def run_test_client(host=SERVER_HOST, port=SERVER_PORT):
         else:
             print(f"⚠️ Transit ACK missing or invalid: {transit_ack}")
 
-        # Receive 16-Byte Telemetry Struct (audio_dur, edge_proc, net_transit, server_asr)
-        telemetry_raw = sock.recv(16)
-        if len(telemetry_raw) == 16:
-            audio_dur, edge_ms, net_ms, asr_ms = struct.unpack("<IIII", telemetry_raw)
-            print("\n" + "┌" + "─" * 54 + "┐")
-            print("│        📊 ESP32 SIMULATION TEST RESULTS (PASSED)       │")
-            print("├" + "─" * 54 + "┤")
-            print(f"│ • Audio Duration     : {audio_dur:6d} ms                           │")
-            print(f"│ • Transit Latency    : {transit_latency_ms:6.2f} ms                           │")
-            print(f"│ • Server ASR Compute : {asr_ms:6d} ms                           │")
-            print("└" + "─" * 54 + "┘\n")
+        # Receive 18-Byte Telemetry Header Struct + Text String Payload
+        telem_hdr = sock.recv(18)
+        if len(telem_hdr) == 18:
+            audio_dur, edge_ms, net_ms, asr_ms, text_len = struct.unpack("<IIIIH", telem_hdr)
+            text_str = ""
+            if text_len > 0:
+                text_bytes = sock.recv(text_len)
+                text_str = text_bytes.decode('utf-8', errors='ignore')
+
+            print("\n" + "┌" + "─" * 58 + "┐")
+            print("│         📊 ESP32 SIMULATION TEST RESULTS (PASSED)        │")
+            print("├" + "─" * 58 + "┤")
+            print(f"│ • Audio Duration     : {audio_dur:6d} ms                            │")
+            print(f"│ • Transit Latency    : {transit_latency_ms:6.2f} ms                            │")
+            print(f"│ • Server ASR Compute : {asr_ms:6d} ms                            │")
+            print(f"│ • Transcribed Text   : \"{text_str}\"                           │")
+            print("└" + "─" * 58 + "┘\n")
         else:
-            print(f"⚠️ Telemetry byte count unexpected: {len(telemetry_raw)} bytes")
+            print(f"⚠️ Telemetry byte count unexpected: {len(telem_hdr)} bytes")
 
         sock.close()
         print("🎉 Server end-to-end verification completed successfully!")

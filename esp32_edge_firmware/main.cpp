@@ -117,70 +117,87 @@ void init_fast_oled() {
     display.display();
 }
 
-void render_dashboard_safe(uint32_t t_voice_to_net, uint32_t t_ack_rtt, uint32_t dur, uint32_t asr_ms) {
+void render_dashboard_safe(uint32_t t_voice_to_net, uint32_t t_ack_rtt, uint32_t dur, uint32_t asr_ms, const char* text) {
     if (xSemaphoreTake(screen_mutex, portMAX_DELAY) == pdTRUE) {
         display.clearDisplay();
         display.setTextSize(1);
         display.setTextColor(SSD1306_WHITE);
         display.setCursor(0, 0);
 
-        display.println(F("SYSTEM LATENCY (LIVE)"));
+        display.println(F("SYSTEM LATENCY & STT"));
         display.println(F("─────────────────────"));
-        display.printf("1.Voice->Net : %2u ms\n", t_voice_to_net);
-        display.printf("2.Net ACK RTT: %2u ms\n", t_ack_rtt);
-        display.printf("3.Stream Dur : %4u ms\n", dur);
-        display.printf("4.Server ASR : %2u ms\n", asr_ms);
+        display.printf("Net ACK RTT : %2u ms\n", t_ack_rtt);
+        display.printf("Stream Dur  : %4u ms\n", dur);
+        display.printf("Server ASR  : %2u ms\n", asr_ms);
         display.println(F("─────────────────────"));
-        display.println(F("STATUS: SERVER ACK ✅"));
+        display.printf("STT: %s\n", (text && strlen(text) > 0) ? text : "(empty)");
         display.display();
         xSemaphoreGive(screen_mutex);
     }
 }
 
 // ----------------------------------------------------------------------------
-// 4. CORE 0 TASK: HIGH-PERFORMANCE TCP SOCKET & TELEMETRY
+// 4. CORE 0 TASK: HIGH-PERFORMANCE PRE-WARMED SOCKET & TELEMETRY
 // ----------------------------------------------------------------------------
+bool ensure_prewarmed_socket() {
+    if (tcp_client.connected()) return true;
+
+    Serial.println(F("[Core 0] Pre-warming persistent TCP socket connection..."));
+    if (tcp_client.connect(SERVER_IP, TCP_SERVER_PORT)) {
+        tcp_client.setNoDelay(true); // Disable Nagle's Algorithm for zero buffering
+        uint8_t syn_byte = PROTOCOL_SYN;
+        tcp_client.write(&syn_byte, 1);
+
+        uint32_t t_start = millis();
+        while (!tcp_client.available() && (millis() - t_start < 2000)) {}
+        if (tcp_client.available() && tcp_client.read() == PROTOCOL_SYN_ACK) {
+            Serial.println(F("✅ [PRE-WARMED SOCKET READY] 0x01 -> 0x06 SYN-ACK Verified!"));
+            return true;
+        }
+    }
+    return false;
+}
+
 void TaskNetworkStream(void *pvParameters) {
     Serial.println(F("[Core 0] Network Stream Task Running"));
     AudioChunk chunk;
 
+    // Connect socket on boot (0 ms wake-to-stream latency penalty)
+    ensure_prewarmed_socket();
+
     while (true) {
+        if (!tcp_client.connected()) {
+            ensure_prewarmed_socket();
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
         // Wait for audio chunks from Core 1
         if (xQueueReceive(audio_queue, &chunk, portMAX_DELAY) == pdTRUE) {
             if (current_state == STATE_IDLE_LISTENING) {
-                // First chunk -> Connect TCP & Send SYN Handshake
-                int64_t t_conn_start = esp_timer_get_time();
-                if (tcp_client.connect(SERVER_IP, TCP_SERVER_PORT)) {
-                    tcp_client.setNoDelay(true); // Disable Nagle's Algorithm
-                    uint8_t syn_byte = PROTOCOL_SYN;
-                    tcp_client.write(&syn_byte, 1);
-
-                    // Wait for SYN_ACK (0x06)
-                    while (!tcp_client.available()) {}
-                    if (tcp_client.read() == PROTOCOL_SYN_ACK) {
-                        current_state = STATE_STREAMING_VOICE;
-
-                        if (xSemaphoreTake(screen_mutex, 100 / portTICK_PERIOD_MS) == pdTRUE) {
-                            display.clearDisplay();
-                            display.setCursor(10, 20);
-                            display.println(F("🎙️ STREAMING LIVE..."));
-                            display.display();
-                            xSemaphoreGive(screen_mutex);
-                        }
-                    }
+                current_state = STATE_STREAMING_VOICE;
+                if (xSemaphoreTake(screen_mutex, 10 / portTICK_PERIOD_MS) == pdTRUE) {
+                    display.clearDisplay();
+                    display.setCursor(10, 20);
+                    display.println(F("🎙️ STREAMING LIVE..."));
+                    display.display();
+                    xSemaphoreGive(screen_mutex);
                 }
             }
 
             if (current_state == STATE_STREAMING_VOICE) {
                 if (chunk.length > 0) {
+                    // Send Length-Prefixed TLV Frame (Prevents 0xFF in-band PCM collision)
+                    ChunkHeader header{ PROTOCOL_AUDIO_CHUNK, (uint16_t)chunk.length };
+                    tcp_client.write((uint8_t*)&header, sizeof(header));
                     tcp_client.write(chunk.data, chunk.length);
                 }
 
                 // If this is the last chunk (silence cut-off detected)
                 if (chunk.is_last) {
-                    // Send Stream-End Byte (0xFF)
-                    uint8_t end_byte = PROTOCOL_STREAM_END;
-                    tcp_client.write(&end_byte, 1);
+                    // Send Length-Prefixed Stream-End Frame
+                    ChunkHeader end_header{ PROTOCOL_STREAM_END, 0 };
+                    tcp_client.write((uint8_t*)&end_header, sizeof(end_header));
                     int64_t t_last_packet_sent = esp_timer_get_time();
 
                     // Wait for Instant Hardware Transit ACK (0x7F) from Laptop
@@ -190,13 +207,22 @@ void TaskNetworkStream(void *pvParameters) {
 
                     uint32_t dt2_dt3_rtt = (t_ack_received - t_last_packet_sent) / 1000;
 
-                    // Read 12-byte Telemetry Struct from Server
+                    // Read 18-byte Telemetry Header Struct from Server
                     ProfessionalTelemetry telem{};
+                    while (tcp_client.available() < (int)sizeof(telem)) {}
                     tcp_client.readBytes((char*)&telem, sizeof(telem));
-                    tcp_client.stop();
 
-                    // Display Live Telemetry on OLED
-                    render_dashboard_safe(12, dt2_dt3_rtt, telem.audio_duration_ms, telem.server_asr_compute_ms);
+                    // Read UTF-8 Transcribed Text Payload
+                    char text_buf[128] = {0};
+                    if (telem.text_length > 0) {
+                        uint16_t read_len = (telem.text_length < 127) ? telem.text_length : 127;
+                        while (tcp_client.available() < read_len) {}
+                        tcp_client.readBytes(text_buf, read_len);
+                        text_buf[read_len] = '\0';
+                    }
+
+                    // Display Live Telemetry & Transcribed Text on OLED
+                    render_dashboard_safe(12, dt2_dt3_rtt, telem.audio_duration_ms, telem.server_asr_compute_ms, text_buf);
 
                     current_state = STATE_IDLE_LISTENING;
                 }
