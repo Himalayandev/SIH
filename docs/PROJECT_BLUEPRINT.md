@@ -51,7 +51,7 @@ This project implements a hybrid **ESP32 Edge Device ↔ Infinix Laptop Server**
   * RAM consumption: **19.8 KB** (Fits within the <256KB constraint)
   * Accuracy: **96.67%**
 
-### Paper 2: *Adaptive Edge-Cloud Inference for Speech-to-Action Systems (ASTA)* (Dec 2025)
+### Paper 2: *Adaptive Edge-Cloud Speech Recognition System* (Dec 2025)
 * **Design Integration**: Direct bare-metal socket streaming to a local compute node (Infinix Laptop), avoiding the >150 ms cloud API overhead.
 * **Validated Server Performance**:
   * Local ASR latency: **87.3 ms $\rightarrow$ 42 ms** with INT8 Whisper/faster-whisper.

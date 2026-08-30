@@ -192,22 +192,8 @@ def handle_client(client_sock, client_addr):
                 time.sleep(0.042)
                 transcribed_text = "Sample audio stream"
 
-        # ASTA Engine Processing
-        try:
-            from asta_engine import ASTACommandValidator, MetricsCollector
-            HAS_ASTA = True
-        except ImportError:
-            HAS_ASTA = False
-
         t_asr_end = time.perf_counter()
         asr_compute_ms = int((t_asr_end - t_asr_start) * 1000)
-
-        if HAS_ASTA:
-            metrics = MetricsCollector.get_metrics(asr_latency_ms=asr_compute_ms, audio_dur_ms=audio_dur_ms)
-            asta_res = ASTACommandValidator.validate_and_repair(transcribed_text)
-        else:
-            metrics = {"cpu_workload_pct": 0.0}
-            asta_res = {"valid": False, "repaired_command": None, "was_repaired": False}
 
         if is_protocol:
             try:
@@ -218,17 +204,14 @@ def handle_client(client_sock, client_addr):
 
         timestamp = time.strftime("%H:%M:%S")
         lang_label = "Hindi (hi)" if detected_lang == "hi" else ("English (en)" if detected_lang == "en" else detected_lang.upper())
-        repaired_cmd = asta_res["repaired_command"] if asta_res["valid"] else "-"
 
         with lock:
             stats["total_requests"] += 1
             stats["last_client_ip"] = client_addr[0]
             stats["last_lang"] = lang_label
             stats["last_text"] = transcribed_text if transcribed_text else "(empty)"
-            stats["last_cmd"] = repaired_cmd
             stats["last_duration_ms"] = audio_dur_ms
             stats["last_latency_ms"] = asr_compute_ms
-            stats["cpu_pct"] = metrics["cpu_workload_pct"]
 
             request_history.insert(0, {
                 "time": timestamp,
@@ -236,8 +219,6 @@ def handle_client(client_sock, client_addr):
                 "lang": lang_label,
                 "dur_ms": audio_dur_ms,
                 "asr_ms": asr_compute_ms,
-                "cpu_pct": metrics["cpu_workload_pct"],
-                "action": repaired_cmd,
                 "text": transcribed_text if transcribed_text else "(empty)"
             })
             if len(request_history) > 10:
@@ -269,10 +250,6 @@ def generate_dashboard():
     status_text.append("Total Requests : ", style=TEXT_SUBDUED)
     status_text.append(f"{stats['total_requests']}\n", style=TEXT_PRIMARY)
     
-    status_text.append("System Load    : ", style=TEXT_SUBDUED)
-    cpu_val_style = ALERT_RUST if stats['cpu_pct'] > 80.0 else TEXT_PRIMARY
-    status_text.append(f"{stats['cpu_pct']:.1f}%\n", style=cpu_val_style)
-    
     status_text.append("ASR Engine     : ", style=TEXT_SUBDUED)
     status_text.append(f"Faster-Whisper '{WHISPER_MODEL_NAME}' (INT8 CPU)", style=TEXT_PRIMARY)
 
@@ -299,9 +276,6 @@ def generate_dashboard():
     metrics_text.append("ASR Compute    : ", style=TEXT_SUBDUED)
     latency_style = ALERT_RUST if stats['last_latency_ms'] > 1000 else TEXT_PRIMARY
     metrics_text.append(f"{stats['last_latency_ms']} ms\n\n", style=latency_style)
-    
-    metrics_text.append("ASTA Action    : ", style=TEXT_SUBDUED)
-    metrics_text.append(f"{stats['last_cmd']}\n", style=f"bold {TEXT_PRIMARY}")
     
     metrics_text.append("Speech Output  : ", style=TEXT_SUBDUED)
     metrics_text.append(f"\"{stats['last_text']}\"", style=TEXT_PRIMARY)
@@ -330,7 +304,6 @@ def generate_dashboard():
     table.add_column("Language", justify="left", style=TEXT_PRIMARY, width=14)
     table.add_column("Duration", justify="right", style=TEXT_PRIMARY, width=10)
     table.add_column("ASR Latency", justify="right", width=12)
-    table.add_column("ASTA Action", justify="left", style=TEXT_PRIMARY, width=22)
     table.add_column("Transcribed Text", justify="left", style=TEXT_PRIMARY, no_wrap=True, overflow="ellipsis")
 
     with lock:
@@ -344,7 +317,6 @@ def generate_dashboard():
                 req["lang"],
                 f"{req['dur_ms']} ms",
                 lat_text,
-                req["action"],
                 req["text"]
             )
 
