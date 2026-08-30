@@ -36,17 +36,19 @@ def benchmark_faster_whisper():
     audio_signal = (np.sin(2 * np.pi * 440 * t) * 0.5).astype(np.float32)
 
     print("\n[2/3] Benchmarking Inference Latency on 2.0-Second Audio Chunk...")
-    t_start = time.perf_counter()
+    t2 = time.perf_counter()
     segments, info = model.transcribe(
         audio_signal,
         beam_size=1,
         best_of=1,
-        language="hi"  # Hindi mode test
+        condition_on_previous_text=False,
+        temperature=0.0,
+        vad_filter=False
     )
-    list(segments)  # Consume generator
-    t_end = time.perf_counter()
+    _ = list(segments)
+    t3 = time.perf_counter()
 
-    latency_ms = (t_end - t_start) * 1000
+    latency_ms = (t3 - t2) * 1000
     realtime_factor = latency_ms / (duration_sec * 1000)
 
     print("\n[3/3] Benchmark Results:")
