@@ -197,8 +197,9 @@ def handle_client(client_sock, client_addr):
                             audio_np,
                             beam_size=BEAM_SIZE,
                             best_of=BEAM_SIZE,
-                            vad_filter=True,
-                            vad_parameters=dict(min_silence_duration_ms=400),
+                            condition_on_previous_text=False,
+                            temperature=0.0,
+                            vad_filter=False,
                             initial_prompt="English and Hindi (Latin/Hinglish) smart assistant voice commands: turn on light, fan, switch, pankha, batti, chalao, band karo, namaste, kaise ho."
                         )
                         detected_lang = getattr(info, 'language', 'en')
@@ -208,8 +209,9 @@ def handle_client(client_sock, client_addr):
                                 audio_np,
                                 beam_size=1,
                                 language="en",
-                                vad_filter=True,
-                                vad_parameters=dict(min_silence_duration_ms=400),
+                                condition_on_previous_text=False,
+                                temperature=0.0,
+                                vad_filter=False,
                                 initial_prompt="English and Hindi (Latin/Hinglish) smart assistant voice commands: turn on light, fan, switch, pankha, batti."
                             )
                             detected_lang = "en"
