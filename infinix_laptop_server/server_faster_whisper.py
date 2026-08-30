@@ -82,116 +82,134 @@ log_msg("=" * 60)
 
 def handle_esp32_connection(client_sock, client_addr):
     client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    client_sock.settimeout(12.0)
+PROTOCOL_AUDIO_CHUNK = 0x02
+
+def handle_esp32_connection(client_sock, client_addr):
+    client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    client_sock.settimeout(60.0) # Persistent pre-warmed idle connection timeout
     is_protocol_client = False
 
     log_msg(f"⚡ [INCOMING CONNECT] Connection initiated from IP: {client_addr[0]}:{client_addr[1]}")
 
     try:
-        first_byte = client_sock.recv(1)
-        if not first_byte:
-            log_msg(f"⚠️ [DISCONNECT] {client_addr[0]} closed socket without data.")
-            client_sock.close()
-            return
-
         pcm_chunks = []
 
-        if first_byte[0] == PROTOCOL_SYN:
-            is_protocol_client = True
-            client_sock.sendall(bytes([PROTOCOL_SYN_ACK]))
-            log_msg(f"🤝 [HANDSHAKE] Binary SYN 0x01 verified. Sent SYN-ACK 0x06 to {client_addr[0]}")
-        else:
-            log_msg(f"🎙️ [RAW STREAM] Direct audio stream started from {client_addr[0]}")
-            pcm_chunks.append(first_byte)
-
-        # Ingest remaining audio data
         while True:
+            # Read 1-byte opcode / header
             try:
-                chunk = client_sock.recv(1024)
-                if not chunk:
-                    break
-
-                if is_protocol_client:
-                    if chunk == bytes([PROTOCOL_STREAM_END]):
-                        client_sock.sendall(bytes([PROTOCOL_TRANSIT_ACK]))
-                        log_msg(f"🚀 [TRANSIT ACK] Sent 0x7F instant hardware ACK to {client_addr[0]}")
-                        break
-                    elif len(chunk) > 1 and chunk[-1] == PROTOCOL_STREAM_END:
-                        pcm_chunks.append(chunk[:-1])
-                        client_sock.sendall(bytes([PROTOCOL_TRANSIT_ACK]))
-                        log_msg(f"🚀 [TRANSIT ACK] Sent 0x7F instant hardware ACK to {client_addr[0]}")
-                        break
-
-                pcm_chunks.append(chunk)
+                opcode_byte = client_sock.recv(1)
             except socket.timeout:
-                log_msg(f"⏱️ [STREAM TIMEOUT] Stopped reading from {client_addr[0]} (Timeout)")
                 break
             except Exception:
                 break
 
-        raw_bytes = b"".join(pcm_chunks)
-        audio_dur_ms = int(len(raw_bytes) / 32)
-        log_msg(f"📥 [AUDIO RECEIVED] Total bytes: {len(raw_bytes)} ({audio_dur_ms} ms) from {client_addr[0]}")
+            if not opcode_byte:
+                log_msg(f"⚠️ [DISCONNECT] {client_addr[0]} closed persistent socket.")
+                break
 
-        # Transcribe with Faster-Whisper (Enhanced Audio Processing & Beam Search)
-        t_asr_start = time.perf_counter()
-        transcribed_text = ""
-        detected_lang = "en"
+            opcode = opcode_byte[0]
 
-        if len(raw_bytes) > 0:
-            audio_np = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            if opcode == PROTOCOL_SYN:
+                is_protocol_client = True
+                client_sock.sendall(bytes([PROTOCOL_SYN_ACK]))
+                log_msg(f"🤝 [PRE-WARMED HANDSHAKE] Binary SYN 0x01 verified. Sent SYN-ACK 0x06 to {client_addr[0]}")
+                continue
 
-            # 1. Noise floor check & smart peak normalization
-            max_peak = np.max(np.abs(audio_np))
-            if max_peak > 0.008:
-                audio_np = audio_np / max_peak
+            elif opcode == PROTOCOL_AUDIO_CHUNK:
+                # Length-Prefixed TLV Frame: Read 2-byte N (payload length)
+                len_bytes = client_sock.recv(2)
+                if len(len_bytes) < 2:
+                    break
+                payload_len = struct.unpack("<H", len_bytes)[0]
+                
+                # Read N bytes of raw PCM16 audio
+                chunk_data = b""
+                while len(chunk_data) < payload_len:
+                    more = client_sock.recv(payload_len - len(chunk_data))
+                    if not more:
+                        break
+                    chunk_data += more
+                
+                pcm_chunks.append(chunk_data)
 
-            if max_peak < 0.003:
-                # Silence / noise floor below mic signal
+            elif opcode == PROTOCOL_STREAM_END:
+                # Stream end signal received
+                len_bytes = client_sock.recv(2) # Consume 2-byte length if present
+                client_sock.sendall(bytes([PROTOCOL_TRANSIT_ACK]))
+                log_msg(f"🚀 [TRANSIT ACK] Sent 0x7F instant hardware ACK to {client_addr[0]}")
+
+                # Process ASR inference on ingested PCM chunks
+                raw_bytes = b"".join(pcm_chunks)
+                audio_dur_ms = int(len(raw_bytes) / 32)
+                log_msg(f"📥 [AUDIO RECEIVED] Total bytes: {len(raw_bytes)} ({audio_dur_ms} ms) from {client_addr[0]}")
+
+                t_asr_start = time.perf_counter()
                 transcribed_text = ""
                 detected_lang = "en"
-            elif whisper_engine:
-                # 2. Fast INT8 decoding with VAD filter & initial prompt for English & Hindi (Latin/Hinglish)
-                segments, info = whisper_engine.transcribe(
-                    audio_np,
-                    beam_size=BEAM_SIZE,
-                    best_of=BEAM_SIZE,
-                    vad_filter=True,
-                    vad_parameters=dict(min_silence_duration_ms=400),
-                    initial_prompt="English and Hindi (Latin/Hinglish) smart assistant voice commands: turn on light, fan, switch, pankha, batti, chalao, band karo, namaste, kaise ho."
-                )
-                detected_lang = getattr(info, 'language', 'en')
 
-                # 3. Enforce Hindi & English ONLY constraint (drop/fallback foreign misdetections like TR, AR)
-                if detected_lang not in ["en", "hi"]:
-                    segments, info = whisper_engine.transcribe(
-                        audio_np,
-                        beam_size=1,
-                        language="en",
-                        vad_filter=True,
-                        vad_parameters=dict(min_silence_duration_ms=400),
-                        initial_prompt="English and Hindi (Latin/Hinglish) smart assistant voice commands: turn on light, fan, switch, pankha, batti."
-                    )
-                    detected_lang = "en"
+                if len(raw_bytes) > 0:
+                    audio_np = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
-                transcribed_text = " ".join([seg.text for seg in segments]).strip()
+                    # 1. Noise floor check & smart peak normalization
+                    max_peak = np.max(np.abs(audio_np))
+                    if max_peak > 0.008:
+                        audio_np = audio_np / max_peak
+
+                    if max_peak < 0.003:
+                        transcribed_text = ""
+                        detected_lang = "en"
+                    elif whisper_engine:
+                        # 2. Fast INT8 decoding with VAD filter
+                        segments, info = whisper_engine.transcribe(
+                            audio_np,
+                            beam_size=BEAM_SIZE,
+                            best_of=BEAM_SIZE,
+                            vad_filter=True,
+                            vad_parameters=dict(min_silence_duration_ms=400),
+                            initial_prompt="English and Hindi (Latin/Hinglish) smart assistant voice commands: turn on light, fan, switch, pankha, batti, chalao, band karo, namaste, kaise ho."
+                        )
+                        detected_lang = getattr(info, 'language', 'en')
+
+                        if detected_lang not in ["en", "hi"]:
+                            segments, info = whisper_engine.transcribe(
+                                audio_np,
+                                beam_size=1,
+                                language="en",
+                                vad_filter=True,
+                                vad_parameters=dict(min_silence_duration_ms=400),
+                                initial_prompt="English and Hindi (Latin/Hinglish) smart assistant voice commands: turn on light, fan, switch, pankha, batti."
+                            )
+                            detected_lang = "en"
+
+                        transcribed_text = " ".join([seg.text for seg in segments]).strip()
+                    else:
+                        time.sleep(0.042)
+                        transcribed_text = "Sample audio processed"
+
+                t_asr_end = time.perf_counter()
+                asr_compute_ms = int((t_asr_end - t_asr_start) * 1000)
+
+                # Send 18-Byte Telemetry Header + UTF-8 Transcribed Text Payload back to ESP32 OLED
+                text_bytes = transcribed_text.encode('utf-8')
+                text_len = len(text_bytes)
+                try:
+                    telemetry_payload = struct.pack(f"<IIIIH{text_len}s", audio_dur_ms, 0, 0, asr_compute_ms, text_len, text_bytes)
+                    client_sock.sendall(telemetry_payload)
+                except Exception as e:
+                    log_msg(f"⚠️ Telemetry send error: {e}")
+
+                lang_label = "Hindi 🇮🇳" if detected_lang == "hi" else ("English 🇬🇧" if detected_lang == "en" else detected_lang.upper())
+                log_msg(f"✅ [STT COMPLETED] Client: {client_addr[0]} | Lang: {lang_label} | Audio: {audio_dur_ms}ms | Latency: {asr_compute_ms}ms | Text: \"{transcribed_text}\"")
+
+                # Reset buffer for next stream on pre-warmed socket
+                pcm_chunks = []
+
             else:
-                time.sleep(0.042)
-                transcribed_text = "Sample audio processed"
-
-        t_asr_end = time.perf_counter()
-        asr_compute_ms = int((t_asr_end - t_asr_start) * 1000)
-
-        if is_protocol_client:
-            try:
-                telemetry_payload = struct.pack("<IIII", audio_dur_ms, 0, 0, asr_compute_ms)
-                client_sock.sendall(telemetry_payload)
-            except Exception:
-                pass
-
-        lang_label = "Hindi 🇮🇳" if detected_lang == "hi" else ("English 🇬🇧" if detected_lang == "en" else detected_lang.upper())
-
-        log_msg(f"✅ [STT COMPLETED] Client: {client_addr[0]} | Lang: {lang_label} | Audio: {audio_dur_ms}ms | Latency: {asr_compute_ms}ms | Text: \"{transcribed_text}\"")
+                # Raw stream fallback for non-protocol clients
+                raw_data = client_sock.recv(1024)
+                if not raw_data:
+                    break
+                pcm_chunks.append(raw_data)
 
     except Exception as e:
         log_msg(f"❌ [ERROR] Client {client_addr[0]}: {e}")

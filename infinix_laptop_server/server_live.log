@@ -28,3 +28,9 @@
 [2026-08-30 19:10:49] 📥 [AUDIO RECEIVED] Total bytes: 47616 (1488 ms) from 127.0.0.1
 [2026-08-30 19:10:51] ✅ [STT COMPLETED] Client: 127.0.0.1 | Lang: English 🇬🇧 | Audio: 1488ms | Latency: 2648ms | CPU: 0.0% | Text: ""
 [2026-08-30 19:10:51] ⚠️ [ASTA UNRECOGNIZED] Voice Input did not match supported IoT command
+[2026-08-30 22:56:47] ============================================================
+[2026-08-30 22:56:47] 🚀 [1/2] Loading Fast Offline Whisper ASR Engine...
+[2026-08-30 22:56:49] ✅ Model loaded: Faster-Whisper 'tiny' (INT8 Quantized, 4 threads)
+[2026-08-30 22:56:49] ============================================================
+[2026-08-30 22:56:49] 🟢 [INFINIX SERVER ONLINE] Listening on 0.0.0.0:8088 for clients...
+[2026-08-30 22:56:49] 📁 Live log file: C:\Users\himan\Desktop\FAHHHHHHHHHHH\SIH-main\infinix_laptop_server\server_live.log
