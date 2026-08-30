@@ -17,18 +17,18 @@ import psutil
 
 # Supported IoT Devices & Actions
 SUPPORTED_ACTIONS = {
-    "turn_on": ["turn on", "turn_on", "switch on", "start", "chalao", "on karo", "on", "activate", "open"],
-    "turn_off": ["turn off", "turn_off", "switch off", "stop", "band karo", "off karo", "off", "deactivate", "close"],
-    "toggle": ["toggle", "badlo", "change"],
-    "status": ["status", "check", "batao", "state"]
+    "turn_on": ["turn on", "turn_on", "switch on", "start", "chalao", "chala do", "on karo", "on", "activate", "open", "jalao", "jalayein", "khol do"],
+    "turn_off": ["turn off", "turn_off", "switch off", "stop", "band karo", "bandh karo", "off karo", "off", "deactivate", "close", "bandh", "bujhao", "bujha do"],
+    "toggle": ["toggle", "badlo", "change", "switch mode"],
+    "status": ["status", "check", "batao", "state", "kya hai"]
 }
 
 SUPPORTED_DEVICES = {
-    "light": ["light", "lights", "bulb", "lamp", "roshni"],
-    "fan": ["fan", "fans", "pankha"],
+    "light": ["light", "lights", "bulb", "lamp", "roshni", "batti", "bijli"],
+    "fan": ["fan", "fans", "pankha", "pankhe"],
     "ac": ["ac", "air conditioner", "cooler"],
-    "switch": ["switch", "plug", "socket"],
-    "door": ["door", "gate", "lock"]
+    "switch": ["switch", "plug", "socket", "board"],
+    "door": ["door", "gate", "lock", "darwaza"]
 }
 
 # Phonetic & Acoustic Normalization Dictionary
@@ -42,8 +42,16 @@ PHONETIC_REPLACEMENTS = [
     (r"\blite\b", "light"),
     (r"\bflight\b", "light"),
     (r"\bnight\b", "light"),
+    (r"\bbatti\b", "light"),
+    (r"\broshni\b", "light"),
+    (r"\bpankha\b", "fan"),
+    (r"\bpankhe\b", "fan"),
     (r"\bchalao\b", "turn on"),
+    (r"\bchala do\b", "turn on"),
+    (r"\bjalao\b", "turn on"),
     (r"\bband karo\b", "turn off"),
+    (r"\bbandh karo\b", "turn off"),
+    (r"\bbandh\b", "turn off"),
     (r"\bon karo\b", "turn on"),
     (r"\boff karo\b", "turn off"),
 ]

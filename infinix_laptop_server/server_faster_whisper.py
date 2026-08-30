@@ -141,23 +141,40 @@ def handle_esp32_connection(client_sock, client_addr):
         if len(raw_bytes) > 0:
             audio_np = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
-            # 1. Peak Normalization (Boost low-volume mic inputs to prevent dropped words)
+            # 1. Noise floor check & smart peak normalization
             max_peak = np.max(np.abs(audio_np))
-            if max_peak > 0.001:
+            if max_peak > 0.008:
                 audio_np = audio_np / max_peak
 
-            if whisper_engine:
-                # 2. Advanced High-Accuracy Beam Decoding & VAD Noise Filter
+            if max_peak < 0.003:
+                # Silence / noise floor below mic signal
+                transcribed_text = ""
+                detected_lang = "en"
+            elif whisper_engine:
+                # 2. Fast INT8 decoding with VAD filter & initial prompt
                 segments, info = whisper_engine.transcribe(
                     audio_np,
                     beam_size=BEAM_SIZE,
                     best_of=BEAM_SIZE,
                     vad_filter=True,
                     vad_parameters=dict(min_silence_duration_ms=400),
-                    initial_prompt="Hindi and English smart assistant commands: turn on light, fan, switch, activate, namaste, kaise ho."
+                    initial_prompt="Hindi and English smart assistant commands: turn on light, fan, switch, pankha, batti, chalao, band karo, namaste."
                 )
-                transcribed_text = " ".join([seg.text for seg in segments]).strip()
                 detected_lang = getattr(info, 'language', 'en')
+
+                # 3. Enforce Hindi & English ONLY constraint (drop/fallback foreign misdetections like TR, AR)
+                if detected_lang not in ["en", "hi"]:
+                    segments, info = whisper_engine.transcribe(
+                        audio_np,
+                        beam_size=1,
+                        language="en",
+                        vad_filter=True,
+                        vad_parameters=dict(min_silence_duration_ms=400),
+                        initial_prompt="Hindi and English smart assistant commands: turn on light, fan, switch."
+                    )
+                    detected_lang = "en"
+
+                transcribed_text = " ".join([seg.text for seg in segments]).strip()
             else:
                 time.sleep(0.042)
                 transcribed_text = "Sample audio processed"

@@ -3,6 +3,7 @@
   "whisper_model": "small",
   "compute_type": "int8",
   "cpu_threads": 4,
-  "beam_size": 5,
+  "beam_size": 1,
+  "supported_languages": ["en", "hi"],
   "log_level": "INFO"
 }
