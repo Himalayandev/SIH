@@ -179,25 +179,8 @@ def handle_esp32_connection(client_sock, client_addr):
                 time.sleep(0.042)
                 transcribed_text = "Sample audio processed"
 
-        # Import ASTA Engine
-        try:
-            from asta_engine import ASTACommandValidator, MetricsCollector, ASTARouter
-            HAS_ASTA = True
-        except ImportError:
-            HAS_ASTA = False
-
         t_asr_end = time.perf_counter()
         asr_compute_ms = int((t_asr_end - t_asr_start) * 1000)
-
-        # ASTA System Metrics & Command Repair Processing
-        if HAS_ASTA:
-            metrics = MetricsCollector.get_metrics(asr_latency_ms=asr_compute_ms, audio_dur_ms=audio_dur_ms)
-            route_mode = ASTARouter.route(metrics)
-            asta_res = ASTACommandValidator.validate_and_repair(transcribed_text)
-        else:
-            metrics = {"cpu_workload_pct": 0, "status": "NORMAL"}
-            route_mode = "LOCAL_EDGE"
-            asta_res = {"valid": False, "repaired_command": None, "was_repaired": False}
 
         if is_protocol_client:
             try:
@@ -208,12 +191,7 @@ def handle_esp32_connection(client_sock, client_addr):
 
         lang_label = "Hindi 🇮🇳" if detected_lang == "hi" else ("English 🇬🇧" if detected_lang == "en" else detected_lang.upper())
 
-        log_msg(f"✅ [STT COMPLETED] Client: {client_addr[0]} | Lang: {lang_label} | Audio: {audio_dur_ms}ms | Latency: {asr_compute_ms}ms | CPU: {metrics['cpu_workload_pct']}% | Text: \"{transcribed_text}\"")
-        if asta_res["valid"]:
-            repair_str = f" (Auto-Repaired from history)" if asta_res["was_repaired"] else ""
-            log_msg(f"🛠️ [ASTA REPAIRED ACTION] Executable Command: \"{asta_res['repaired_command']}\"{repair_str} | Mode: {route_mode}")
-        else:
-            log_msg(f"⚠️ [ASTA UNRECOGNIZED] Voice Input did not match supported IoT command")
+        log_msg(f"✅ [STT COMPLETED] Client: {client_addr[0]} | Lang: {lang_label} | Audio: {audio_dur_ms}ms | Latency: {asr_compute_ms}ms | Text: \"{transcribed_text}\"")
 
     except Exception as e:
         log_msg(f"❌ [ERROR] Client {client_addr[0]}: {e}")
