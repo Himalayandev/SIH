@@ -52,12 +52,13 @@ This project implements a hybrid **ESP32 Edge Device ↔ Infinix Laptop Server**
   * Accuracy: **96.67%**
 
 ### Paper 2: *Adaptive Edge-Cloud Speech Recognition System* (Dec 2025)
-* **Design Integration**: Direct socket streaming to local AMD Ryzen 7 5825U CPU compute node, running quantized **Faster-Whisper `tiny.en` (INT8)**.
+* **Design Integration**: Direct socket streaming to local AMD Ryzen 7 5825U CPU compute node, running quantized **Faster-Whisper `tiny` (INT8 Multilingual: English & Hindi Latin)**.
 * **Validated Server Performance**:
-  * Model Architecture: **`tiny.en` INT8 (39M parameters)**
+  * Model Architecture: **`tiny` INT8 (39M parameters)**
+  * Supported Languages: **English (`en`) & Hindi Latin / Hinglish (`hi`)**
   * Processing Speed: **~10x real-time speed** on Ryzen CPU
   * Memory Footprint: **~150 MB RAM**
-  * Local ASR compute latency: **<30 ms**
+  * Local ASR compute latency: **<35 ms**
 
 ---
 

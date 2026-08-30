@@ -23,9 +23,9 @@ def benchmark_faster_whisper():
     print("🧪 FASTER-WHISPER MULTILINGUAL (HINDI & ENGLISH) BENCHMARK")
     print("=" * 65)
 
-    print("\n[1/3] Initializing Faster-Whisper 'tiny.en' Model (INT8 CPU Optimized)...")
+    print("\n[1/3] Initializing Faster-Whisper 'tiny' Multilingual Model (English & Hindi Latin)...")
     t0 = time.perf_counter()
-    model = WhisperModel("tiny.en", device="cpu", compute_type="int8", cpu_threads=4)
+    model = WhisperModel("tiny", device="cpu", compute_type="int8", cpu_threads=4)
     t1 = time.perf_counter()
     print(f"✅ Model Loaded in {(t1 - t0)*1000:.2f} ms")
 
