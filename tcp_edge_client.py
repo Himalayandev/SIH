@@ -66,6 +66,8 @@ VAD_RMS_THRESHOLD = 0.005
 PROTOCOL_HEARTBEAT = 0x00
 PROTOCOL_SYN = 0x01
 PROTOCOL_SYN_ACK = 0x06
+PROTOCOL_SYN_DENIED = 0x07
+PROTOCOL_SYN_PENDING = 0x08
 PROTOCOL_AUDIO_CHUNK = 0x02
 PROTOCOL_STREAM_END = 0xFF
 PROTOCOL_TRANSIT_ACK = 0x7F
@@ -146,10 +148,19 @@ def stream_audio_to_server(host, port, stream_sec=4.0):
         sock.sendall(bytes([PROTOCOL_SYN]))
 
         ack = sock.recv(1)
+        if ack and ack[0] == PROTOCOL_SYN_PENDING:
+            print("⏳ Server Admin authorization required (0x08). Waiting for decision...")
+            ack = sock.recv(1)
+
+        if ack and ack[0] == PROTOCOL_SYN_DENIED:
+            print("⛔ Server rejected connection authorization request (0x07).")
+            sock.close()
+            return False
+
         if not ack or ack[0] != PROTOCOL_SYN_ACK:
             print(f"⚠️ Protocol handshake mismatch: {ack}")
         else:
-            print("✅ Pre-warmed Handshake ACK (0x06) verified!")
+            print("✅ Pre-warmed Handshake ACK (0x06) verified! Connection Authorized.")
 
         # 2. Record & Stream Microphone PCM16 Audio in TLV Framed Chunks
         print(f"🎙️ Streaming speech for {stream_sec:.1f} seconds...")
