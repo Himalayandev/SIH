@@ -44,8 +44,7 @@ except ImportError:
 
 # Configuration
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
-TCP_SERVER_PORT = 8088
-WHISPER_MODEL_NAME = "tiny.en"
+WHISPER_MODEL_NAME = "tiny"
 COMPUTE_TYPE = "int8"
 CPU_THREADS = 4
 BEAM_SIZE = 1
@@ -172,7 +171,7 @@ def handle_client(client_sock, client_addr):
                     best_of=BEAM_SIZE,
                     vad_filter=True,
                     vad_parameters=dict(min_silence_duration_ms=400),
-                    initial_prompt="Hindi and English smart assistant commands: turn on light, fan, switch, pankha, batti, chalao, band karo, namaste."
+                    initial_prompt="English and Hindi (Latin/Hinglish) smart assistant voice commands: turn on light, fan, switch, pankha, batti, chalao, band karo, namaste, kaise ho."
                 )
                 detected_lang = getattr(info, 'language', 'en')
 
@@ -184,7 +183,7 @@ def handle_client(client_sock, client_addr):
                         language="en",
                         vad_filter=True,
                         vad_parameters=dict(min_silence_duration_ms=400),
-                        initial_prompt="Hindi and English smart assistant commands: turn on light, fan, switch."
+                        initial_prompt="English and Hindi (Latin/Hinglish) smart assistant voice commands: turn on light, fan, switch, pankha, batti."
                     )
                     detected_lang = "en"
 
