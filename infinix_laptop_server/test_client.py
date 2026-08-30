@@ -25,6 +25,8 @@ SERVER_PORT = 8088
 
 PROTOCOL_SYN = 0x01
 PROTOCOL_SYN_ACK = 0x06
+PROTOCOL_SYN_DENIED = 0x07
+PROTOCOL_SYN_PENDING = 0x08
 PROTOCOL_AUDIO_CHUNK = 0x02
 PROTOCOL_STREAM_END = 0xFF
 PROTOCOL_TRANSIT_ACK = 0x7F
@@ -48,12 +50,24 @@ def run_test_client(host=SERVER_HOST, port=SERVER_PORT):
         print("\n--> [1/4] Sending Pre-Warmed SYN (0x01)...")
         sock.sendall(bytes([PROTOCOL_SYN]))
 
-        # Read SYN-ACK
+        # Read SYN response
         ack = sock.recv(1)
-        if not ack or ack[0] != PROTOCOL_SYN_ACK:
+        if not ack:
+            print("❌ Handshake failed! No response from server.")
+            return False
+
+        if ack[0] == PROTOCOL_SYN_PENDING:
+            print("⏳ [<-- PENDING 0x08] Server Admin authorization required! Waiting for decision...")
+            ack = sock.recv(1)
+
+        if ack[0] == PROTOCOL_SYN_DENIED:
+            print("⛔ [<-- DENIED 0x07] Server rejected connection authorization request.")
+            return False
+
+        if ack[0] != PROTOCOL_SYN_ACK:
             print(f"❌ Handshake failed! Expected 0x06, got {ack}")
             return False
-        print("<-- [2/4] Pre-Warmed Handshake ACK (0x06) verified! Socket pre-warmed (0ms wake delay).")
+        print("<-- [2/4] Pre-Warmed Handshake ACK (0x06) verified! Connection Authorized.")
 
         # 2. Generate 1.5 sec of 16kHz PCM16 audio (synthetic 440Hz tone)
         sample_rate = 16000

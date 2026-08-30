@@ -5,5 +5,8 @@
   "cpu_threads": 4,
   "beam_size": 1,
   "supported_languages": ["en", "hi"],
+  "require_client_authorization": true,
+  "auth_mode": "prompt",
+  "whitelisted_ips": ["127.0.0.1"],
   "log_level": "INFO"
 }

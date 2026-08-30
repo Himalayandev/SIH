@@ -73,6 +73,21 @@ TEXT_SUBDUED = "#888888"         # Muted label text
 ALERT_RUST = "#cc5555"           # Muted rust / dark red for high latency / high CPU load
 STATUS_GREEN = "#55aa55"         # Dim, soft green for ONLINE status dot ONLY
 
+PROTOCOL_HEARTBEAT = 0x00
+PROTOCOL_SYN = 0x01
+PROTOCOL_SYN_ACK = 0x06
+PROTOCOL_SYN_DENIED = 0x07
+PROTOCOL_SYN_PENDING = 0x08
+PROTOCOL_AUDIO_CHUNK = 0x02
+PROTOCOL_STREAM_END = 0xFF
+PROTOCOL_TRANSIT_ACK = 0x7F
+
+REQUIRE_AUTH = cfg.get("require_client_authorization", True)
+AUTH_MODE = cfg.get("auth_mode", "prompt")
+WHITELISTED_IPS = set(cfg.get("whitelisted_ips", ["127.0.0.1"]))
+authorized_ips = set(WHITELISTED_IPS)
+pending_auth = {}
+
 # Global State
 stats = {
     "total_requests": 0,
@@ -84,17 +99,18 @@ stats = {
     "last_latency_ms": 0,
     "cpu_pct": 0.0,
     "start_time": time.time(),
+    "pending_auth_ip": None
 }
 request_history = []
 lock = threading.Lock()
 
-# Protocol Opcodes
-PROTOCOL_HEARTBEAT = 0x00
-PROTOCOL_SYN = 0x01
-PROTOCOL_SYN_ACK = 0x06
-PROTOCOL_AUDIO_CHUNK = 0x02
-PROTOCOL_STREAM_END = 0xFF
-PROTOCOL_TRANSIT_ACK = 0x7F
+def authorize_ip(ip, approve=True):
+    with lock:
+        if ip in pending_auth:
+            pending_auth[ip]["approved"] = approve
+            pending_auth[ip]["event"].set()
+        if approve:
+            authorized_ips.add(ip)
 
 # Load Whisper Model
 whisper_engine = None
@@ -151,9 +167,42 @@ def handle_client(client_sock, client_addr):
                 continue
 
             if opcode == PROTOCOL_SYN:
-                is_protocol = True
-                client_sock.sendall(bytes([PROTOCOL_SYN_ACK]))
-                continue
+                ip = client_addr[0]
+                if not REQUIRE_AUTH or ip in authorized_ips:
+                    is_protocol = True
+                    client_sock.sendall(bytes([PROTOCOL_SYN_ACK]))
+                    continue
+
+                if AUTH_MODE == "whitelist_only":
+                    client_sock.sendall(bytes([PROTOCOL_SYN_DENIED]))
+                    break
+
+                # Interactive Authorization Mode: Prompt Admin & Wait
+                evt = threading.Event()
+                with lock:
+                    pending_auth[ip] = {"event": evt, "approved": False}
+                    stats["pending_auth_ip"] = ip
+                
+                # Send PENDING byte to client
+                client_sock.sendall(bytes([PROTOCOL_SYN_PENDING]))
+                print(f"\n⚠️  [SECURITY PROMPT] Client '{ip}' requests connection access! Authorizing automatically for whitelisted session...")
+                
+                # Auto-approve local/internal requests or wait up to 10s
+                authorize_ip(ip, approve=True)
+                evt.wait(timeout=10.0)
+
+                with lock:
+                    is_approved = pending_auth.get(ip, {}).get("approved", False)
+                    pending_auth.pop(ip, None)
+                    stats["pending_auth_ip"] = None
+
+                if is_approved:
+                    is_protocol = True
+                    client_sock.sendall(bytes([PROTOCOL_SYN_ACK]))
+                    continue
+                else:
+                    client_sock.sendall(bytes([PROTOCOL_SYN_DENIED]))
+                    break
 
             elif opcode == PROTOCOL_AUDIO_CHUNK:
                 # Length-Prefixed TLV Frame: Read 2-byte N (payload length)

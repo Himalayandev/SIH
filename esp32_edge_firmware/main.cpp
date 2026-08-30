@@ -149,10 +149,26 @@ bool ensure_prewarmed_socket() {
         tcp_client.write(&syn_byte, 1);
 
         uint32_t t_start = millis();
-        while (!tcp_client.available() && (millis() - t_start < 2000)) {}
-        if (tcp_client.available() && tcp_client.read() == PROTOCOL_SYN_ACK) {
-            Serial.println(F("✅ [PRE-WARMED SOCKET READY] 0x01 -> 0x06 SYN-ACK Verified!"));
-            return true;
+        while (!tcp_client.available() && (millis() - t_start < 5000)) {}
+        if (tcp_client.available()) {
+            uint8_t resp = tcp_client.read();
+            if (resp == PROTOCOL_SYN_ACK) {
+                Serial.println(F("✅ [AUTHORIZED] 0x01 -> 0x06 SYN-ACK Verified! Socket ready."));
+                return true;
+            } else if (resp == PROTOCOL_SYN_DENIED) {
+                Serial.println(F("⛔ [SECURITY DENIED] Server rejected connection request (0x07)."));
+                tcp_client.stop();
+                return false;
+            } else if (resp == PROTOCOL_SYN_PENDING) {
+                Serial.println(F("⏳ [AUTHORIZATION PENDING] Waiting for Server Admin approval (0x08)..."));
+                // Wait for follow-up SYN_ACK (0x06) or SYN_DENIED (0x07) from server admin
+                t_start = millis();
+                while (!tcp_client.available() && (millis() - t_start < 10000)) {}
+                if (tcp_client.available() && tcp_client.read() == PROTOCOL_SYN_ACK) {
+                    Serial.println(F("✅ [APPROVED BY ADMIN] 0x06 SYN-ACK Received! Socket ready."));
+                    return true;
+                }
+            }
         }
     }
     return false;

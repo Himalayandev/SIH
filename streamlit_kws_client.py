@@ -65,6 +65,8 @@ N_FRAMES = 49
 PROTOCOL_HEARTBEAT   = 0x00
 PROTOCOL_SYN         = 0x01
 PROTOCOL_SYN_ACK     = 0x06
+PROTOCOL_SYN_DENIED  = 0x07
+PROTOCOL_SYN_PENDING = 0x08
 PROTOCOL_AUDIO_CHUNK = 0x02
 PROTOCOL_STREAM_END  = 0xFF
 PROTOCOL_TRANSIT_ACK = 0x7F
@@ -226,11 +228,24 @@ def kws_engine_loop(state_obj, host, port, act_thresh, vad_thresh, stream_durati
                 # Send SYN Handshake (0x01)
                 s.sendall(bytes([PROTOCOL_SYN]))
                 ack = s.recv(1)
+
+                if ack and ack[0] == PROTOCOL_SYN_PENDING:
+                    state_obj.add_log("⏳ [AUTHORIZATION PENDING] Waiting for Server Admin approval (0x08)...")
+                    ack = s.recv(1)
+
+                if ack and ack[0] == PROTOCOL_SYN_DENIED:
+                    state_obj.add_log("⛔ [SECURITY DENIED] Server rejected connection authorization request (0x07).")
+                    s.close()
+                    with state_obj.lock:
+                        state_obj.server_connected = False
+                    state_obj.status = "Denied"
+                    return False
+
                 if ack and ack[0] == PROTOCOL_SYN_ACK:
                     sock = s
                     with state_obj.lock:
                         state_obj.server_connected = True
-                    state_obj.add_log("🤝 [PRE-WARMED SOCKET READY] 0x01 -> 0x06 SYN-ACK Verified! (0ms wake delay)")
+                    state_obj.add_log("🤝 [PRE-WARMED SOCKET AUTHORIZED] 0x01 -> 0x06 SYN-ACK Verified! (0ms wake delay)")
                     state_obj.status = "Listening"
                     return True
                 else:

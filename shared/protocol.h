@@ -9,7 +9,9 @@
 // Binary Protocol Opcodes
 #define PROTOCOL_HEARTBEAT   0x00 // ESP32 -> Server: Idle TCP keepalive ping (1-byte)
 #define PROTOCOL_SYN         0x01 // ESP32 -> Server: Connection handshake request
-#define PROTOCOL_SYN_ACK     0x06 // Server -> ESP32: Handshake acknowledged
+#define PROTOCOL_SYN_ACK     0x06 // Server -> ESP32: Handshake acknowledged / accepted
+#define PROTOCOL_SYN_DENIED  0x07 // Server -> ESP32: Connection handshake denied / rejected
+#define PROTOCOL_SYN_PENDING 0x08 // Server -> ESP32: Authorization request pending admin review
 #define PROTOCOL_AUDIO_CHUNK 0x02 // ESP32 -> Server: Length-prefixed audio chunk packet
 #define PROTOCOL_STREAM_END  0xFF // ESP32 -> Server: Length-prefixed stream end packet
 #define PROTOCOL_TRANSIT_ACK 0x7F // Server -> ESP32: Instant receipt ACK before ASR compute

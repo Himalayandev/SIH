@@ -67,9 +67,16 @@ if os.path.exists(CONFIG_PATH):
 PROTOCOL_HEARTBEAT = 0x00
 PROTOCOL_SYN = 0x01
 PROTOCOL_SYN_ACK = 0x06
+PROTOCOL_SYN_DENIED = 0x07
+PROTOCOL_SYN_PENDING = 0x08
 PROTOCOL_AUDIO_CHUNK = 0x02
 PROTOCOL_STREAM_END = 0xFF
 PROTOCOL_TRANSIT_ACK = 0x7F
+
+REQUIRE_AUTH = cfg.get("require_client_authorization", True)
+AUTH_MODE = cfg.get("auth_mode", "prompt")
+WHITELISTED_IPS = set(cfg.get("whitelisted_ips", ["127.0.0.1"]))
+authorized_ips = set(WHITELISTED_IPS)
 
 log_msg("=" * 60)
 log_msg("🚀 [1/2] Loading Fast Offline Whisper ASR Engine...")
@@ -125,10 +132,16 @@ def handle_esp32_connection(client_sock, client_addr):
                 continue
 
             if opcode == PROTOCOL_SYN:
-                is_protocol_client = True
-                client_sock.sendall(bytes([PROTOCOL_SYN_ACK]))
-                log_msg(f"🤝 [PRE-WARMED HANDSHAKE] Binary SYN 0x01 verified. Sent SYN-ACK 0x06 to {client_addr[0]}")
-                continue
+                ip = client_addr[0]
+                if not REQUIRE_AUTH or ip in authorized_ips:
+                    is_protocol_client = True
+                    client_sock.sendall(bytes([PROTOCOL_SYN_ACK]))
+                    log_msg(f"🤝 [PRE-WARMED HANDSHAKE ACCEPTED] Sent SYN-ACK 0x06 to Authorized Client {ip}")
+                    continue
+                else:
+                    client_sock.sendall(bytes([PROTOCOL_SYN_DENIED]))
+                    log_msg(f"⛔ [SECURITY REJECTED] Connection request from Unauthorized Client {ip} DENIED 0x07")
+                    break
 
             elif opcode == PROTOCOL_AUDIO_CHUNK:
                 # Length-Prefixed TLV Frame: Read 2-byte N (payload length)
