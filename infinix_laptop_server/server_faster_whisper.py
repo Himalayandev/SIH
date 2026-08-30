@@ -64,9 +64,10 @@ if os.path.exists(CONFIG_PATH):
     except Exception as e:
         log_msg(f"⚠️ Failed to parse config.json: {e}")
 
-# Protocol Constants
+PROTOCOL_HEARTBEAT = 0x00
 PROTOCOL_SYN = 0x01
 PROTOCOL_SYN_ACK = 0x06
+PROTOCOL_AUDIO_CHUNK = 0x02
 PROTOCOL_STREAM_END = 0xFF
 PROTOCOL_TRANSIT_ACK = 0x7F
 
@@ -75,14 +76,25 @@ log_msg("🚀 [1/2] Loading Fast Offline Whisper ASR Engine...")
 if HAS_FASTER_WHISPER:
     whisper_engine = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type=COMPUTE_TYPE, cpu_threads=CPU_THREADS)
     log_msg(f"✅ Model loaded: Faster-Whisper '{WHISPER_MODEL_NAME}' ({COMPUTE_TYPE.upper()} Quantized, {CPU_THREADS} threads)")
+    
+    # Dummy Inference Warm-Up (Eliminates CTranslate2 First-Run Cold Start Latency Spike)
+    log_msg("⚡ Pre-warming CTranslate2 CPU vector engines with 1-sec dummy inference...")
+    t_warm_start = time.perf_counter()
+    dummy_audio = np.zeros(16000, dtype=np.float32)
+    _ = whisper_engine.transcribe(
+        dummy_audio,
+        beam_size=1,
+        best_of=1,
+        condition_on_previous_text=False,
+        temperature=0.0,
+        vad_filter=False
+    )
+    t_warm_end = time.perf_counter()
+    log_msg(f"✅ Model Pre-Warmed in {(t_warm_end - t_warm_start)*1000:.2f} ms! Ready for sub-30ms execution.")
 else:
     whisper_engine = None
     log_msg("⚠️ faster-whisper not installed. Running in high-speed simulation mode.")
 log_msg("=" * 60)
-
-def handle_esp32_connection(client_sock, client_addr):
-    client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-PROTOCOL_AUDIO_CHUNK = 0x02
 
 def handle_esp32_connection(client_sock, client_addr):
     client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -95,7 +107,6 @@ def handle_esp32_connection(client_sock, client_addr):
         pcm_chunks = []
 
         while True:
-            # Read 1-byte opcode / header
             try:
                 opcode_byte = client_sock.recv(1)
             except socket.timeout:
@@ -108,6 +119,10 @@ def handle_esp32_connection(client_sock, client_addr):
                 break
 
             opcode = opcode_byte[0]
+
+            if opcode == PROTOCOL_HEARTBEAT:
+                # 1-Byte TCP Keepalive Ping from ESP32
+                continue
 
             if opcode == PROTOCOL_SYN:
                 is_protocol_client = True
@@ -159,13 +174,14 @@ def handle_esp32_connection(client_sock, client_addr):
                         transcribed_text = ""
                         detected_lang = "en"
                     elif whisper_engine:
-                        # 2. Fast INT8 decoding with VAD filter
+                        # 2. Hardened INT8 decoding (greedy search, no context loop, zero VAD overhead)
                         segments, info = whisper_engine.transcribe(
                             audio_np,
                             beam_size=BEAM_SIZE,
                             best_of=BEAM_SIZE,
-                            vad_filter=True,
-                            vad_parameters=dict(min_silence_duration_ms=400),
+                            condition_on_previous_text=False,
+                            temperature=0.0,
+                            vad_filter=False,
                             initial_prompt="English and Hindi (Latin/Hinglish) smart assistant voice commands: turn on light, fan, switch, pankha, batti, chalao, band karo, namaste, kaise ho."
                         )
                         detected_lang = getattr(info, 'language', 'en')
@@ -175,8 +191,9 @@ def handle_esp32_connection(client_sock, client_addr):
                                 audio_np,
                                 beam_size=1,
                                 language="en",
-                                vad_filter=True,
-                                vad_parameters=dict(min_silence_duration_ms=400),
+                                condition_on_previous_text=False,
+                                temperature=0.0,
+                                vad_filter=False,
                                 initial_prompt="English and Hindi (Latin/Hinglish) smart assistant voice commands: turn on light, fan, switch, pankha, batti."
                             )
                             detected_lang = "en"

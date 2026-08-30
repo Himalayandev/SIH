@@ -7,6 +7,7 @@
 #define TCP_SERVER_PORT      8088
 
 // Binary Protocol Opcodes
+#define PROTOCOL_HEARTBEAT   0x00 // ESP32 -> Server: Idle TCP keepalive ping (1-byte)
 #define PROTOCOL_SYN         0x01 // ESP32 -> Server: Connection handshake request
 #define PROTOCOL_SYN_ACK     0x06 // Server -> ESP32: Handshake acknowledged
 #define PROTOCOL_AUDIO_CHUNK 0x02 // ESP32 -> Server: Length-prefixed audio chunk packet
