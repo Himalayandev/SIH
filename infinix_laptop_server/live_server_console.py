@@ -480,6 +480,24 @@ def generate_dashboard():
     layout["table_panel"].update(panel_table)
     return layout
 
+def keyboard_listener_loop():
+    while True:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                if msvcrt.kbhit():
+                    ch = msvcrt.getch().decode('utf-8', errors='ignore').upper()
+                    with lock:
+                        pending_ip = stats.get("pending_auth_ip")
+                        if pending_ip:
+                            if ch == 'Y':
+                                authorize_ip(pending_ip, approve=True)
+                            elif ch == 'N':
+                                authorize_ip(pending_ip, approve=False)
+            time.sleep(0.05)
+        except Exception:
+            time.sleep(0.1)
+
 def main():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -497,6 +515,9 @@ def main():
 
     t_listen = threading.Thread(target=listen_loop, daemon=True)
     t_listen.start()
+
+    t_keys = threading.Thread(target=keyboard_listener_loop, daemon=True)
+    t_keys.start()
 
     if HAS_RICH:
         console = Console()
