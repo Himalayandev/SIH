@@ -124,20 +124,20 @@ void render_dashboard_safe(uint32_t t_voice_to_net, uint32_t t_ack_rtt, uint32_t
         display.setTextColor(SSD1306_WHITE);
         display.setCursor(0, 0);
 
-        display.println(F("SYSTEM LATENCY & STT"));
+        float total_e2e = (float)t_ack_rtt + (float)asr_ms;
+        display.println(F(">> ACTIVATE DETECTED"));
+        display.printf("Uplink/Net : %4.1f ms\n", (float)t_ack_rtt);
+        display.printf("ASR Compute: %4.1f ms\n", (float)asr_ms);
+        display.printf("Total E2E  : %4.1f ms\n", total_e2e);
         display.println(F("─────────────────────"));
-        display.printf("Net ACK RTT : %2u ms\n", t_ack_rtt);
-        display.printf("Stream Dur  : %4u ms\n", dur);
-        display.printf("Server ASR  : %2u ms\n", asr_ms);
-        display.println(F("─────────────────────"));
-        display.printf("STT: %s\n", (text && strlen(text) > 0) ? text : "(empty)");
+        display.printf("\"%s\"\n", (text && strlen(text) > 0) ? text : "(listening)");
         display.display();
         xSemaphoreGive(screen_mutex);
     }
 }
 
 // ----------------------------------------------------------------------------
-// 4. CORE 0 TASK: HIGH-PERFORMANCE PRE-WARMED SOCKET & TELEMETRY
+// 4. CORE 0 TASK: HIGH-PERFORMANCE PRE-WARMED SOCKET & KEEPALIVE
 // ----------------------------------------------------------------------------
 bool ensure_prewarmed_socket() {
     if (tcp_client.connected()) return true;
@@ -159,10 +159,11 @@ bool ensure_prewarmed_socket() {
 }
 
 void TaskNetworkStream(void *pvParameters) {
-    Serial.println(F("[Core 0] Network Stream Task Running"));
+    Serial.println(F("[Core 0] Network Stream Task Running on Core 0"));
     AudioChunk chunk;
+    uint32_t t_last_activity = millis();
 
-    // Connect socket on boot (0 ms wake-to-stream latency penalty)
+    // Pre-warm socket on startup (0 ms wake handshake penalty)
     ensure_prewarmed_socket();
 
     while (true) {
@@ -172,13 +173,23 @@ void TaskNetworkStream(void *pvParameters) {
             continue;
         }
 
-        // Wait for audio chunks from Core 1
-        if (xQueueReceive(audio_queue, &chunk, portMAX_DELAY) == pdTRUE) {
+        // Send 1-Byte TCP Keepalive Heartbeat (0x00) every 20 seconds when idle
+        if (millis() - t_last_activity > 20000 && current_state == STATE_IDLE_LISTENING) {
+            uint8_t heartbeat = PROTOCOL_HEARTBEAT;
+            tcp_client.write(&heartbeat, 1);
+            t_last_activity = millis();
+        }
+
+        // Wait for audio chunks from Core 1 Queue
+        if (xQueueReceive(audio_queue, &chunk, pdMS_TO_TICKS(100)) == pdTRUE) {
+            t_last_activity = millis();
+
             if (current_state == STATE_IDLE_LISTENING) {
                 current_state = STATE_STREAMING_VOICE;
                 if (xSemaphoreTake(screen_mutex, 10 / portTICK_PERIOD_MS) == pdTRUE) {
                     display.clearDisplay();
-                    display.setCursor(10, 20);
+                    display.setCursor(5, 20);
+                    display.println(F(">> ACTIVATE DETECTED"));
                     display.println(F("🎙️ STREAMING LIVE..."));
                     display.display();
                     xSemaphoreGive(screen_mutex);
@@ -193,9 +204,8 @@ void TaskNetworkStream(void *pvParameters) {
                     tcp_client.write(chunk.data, chunk.length);
                 }
 
-                // If this is the last chunk (silence cut-off detected)
                 if (chunk.is_last) {
-                    // Send Length-Prefixed Stream-End Frame
+                    // Send Stream End TLV Frame
                     ChunkHeader end_header{ PROTOCOL_STREAM_END, 0 };
                     tcp_client.write((uint8_t*)&end_header, sizeof(end_header));
                     int64_t t_last_packet_sent = esp_timer_get_time();
@@ -207,7 +217,7 @@ void TaskNetworkStream(void *pvParameters) {
 
                     uint32_t dt2_dt3_rtt = (t_ack_received - t_last_packet_sent) / 1000;
 
-                    // Read 18-byte Telemetry Header Struct from Server
+                    // Read 18-byte Telemetry Header Struct
                     ProfessionalTelemetry telem{};
                     while (tcp_client.available() < (int)sizeof(telem)) {}
                     tcp_client.readBytes((char*)&telem, sizeof(telem));
@@ -221,8 +231,8 @@ void TaskNetworkStream(void *pvParameters) {
                         text_buf[read_len] = '\0';
                     }
 
-                    // Display Live Telemetry & Transcribed Text on OLED
-                    render_dashboard_safe(12, dt2_dt3_rtt, telem.audio_duration_ms, telem.server_asr_compute_ms, text_buf);
+                    // Render Telemetry Dashboard for Judges on SSD1306 OLED
+                    render_dashboard_safe(1, dt2_dt3_rtt, telem.audio_duration_ms, telem.server_asr_compute_ms, text_buf);
 
                     current_state = STATE_IDLE_LISTENING;
                 }
@@ -232,22 +242,27 @@ void TaskNetworkStream(void *pvParameters) {
 }
 
 // ----------------------------------------------------------------------------
-// 5. CORE 1 TASK: I2S DMA ACQUISITION & TINYML KWS INFERENCE
+// 5. CORE 1 TASK: I2S DMA ACQUISITION & TINYML KWS INFERENCE (WITH PRE-ROLL)
 // ----------------------------------------------------------------------------
 void TaskAudioKWS(void *pvParameters) {
-    Serial.println(F("[Core 1] I2S Audio & KWS Task Running"));
+    Serial.println(F("[Core 1] I2S Audio, KWS & Pre-Roll Task Running on Core 1"));
     uint8_t dma_buffer[CHUNK_BYTES];
     size_t bytes_read = 0;
     bool is_streaming = false;
     int64_t t_last_sound = 0;
 
+    // 100 ms Lookback Ring Buffer (3 x 512-byte PCM chunks)
+    uint8_t preroll_ring[3][CHUNK_BYTES];
+    size_t preroll_lens[3] = {0, 0, 0};
+    uint8_t preroll_idx = 0;
+
     while (true) {
-        // Read raw 16kHz PCM16 samples directly from DMA
+        // Read raw 16kHz PCM16 samples directly from I2S DMA
         i2s_read(I2S_PORT, dma_buffer, CHUNK_BYTES, &bytes_read, portMAX_DELAY);
 
         int16_t* samples = (int16_t*)dma_buffer;
         int32_t sum = 0;
-        for (int i = 0; i < bytes_read / 2; ++i) {
+        for (int i = 0; i < (int)(bytes_read / 2); ++i) {
             sum += abs(samples[i]);
         }
         int32_t avg_amp = sum / (bytes_read / 2);
@@ -255,12 +270,29 @@ void TaskAudioKWS(void *pvParameters) {
         int64_t now = esp_timer_get_time();
 
         if (!is_streaming) {
-            // --- TinyML KWS Idle Listening Mode ---
-            // ESP32-S3 Vector SIMD accelerates INT8 inference
-            if (avg_amp > 850) { // Speech energy threshold
+            // Store frame into 100ms Lookback Pre-Roll Buffer
+            memcpy(preroll_ring[preroll_idx], dma_buffer, bytes_read);
+            preroll_lens[preroll_idx] = bytes_read;
+            preroll_idx = (preroll_idx + 1) % 3;
+
+            // KWS Speech Energy Trigger
+            if (avg_amp > 850) {
                 is_streaming = true;
                 t_last_sound = now;
 
+                // 1. Flush historical 100ms pre-roll ring buffer first (Zero Command Clipping)
+                for (int i = 0; i < 3; ++i) {
+                    uint8_t idx = (preroll_idx + i) % 3;
+                    if (preroll_lens[idx] > 0) {
+                        AudioChunk pchunk;
+                        memcpy(pchunk.data, preroll_ring[idx], preroll_lens[idx]);
+                        pchunk.length = preroll_lens[idx];
+                        pchunk.is_last = false;
+                        xQueueSend(audio_queue, &pchunk, portMAX_DELAY);
+                    }
+                }
+
+                // 2. Queue current live chunk
                 AudioChunk chunk;
                 memcpy(chunk.data, dma_buffer, bytes_read);
                 chunk.length = bytes_read;
@@ -268,7 +300,7 @@ void TaskAudioKWS(void *pvParameters) {
                 xQueueSend(audio_queue, &chunk, portMAX_DELAY);
             }
         } else {
-            // --- Active Streaming Mode ---
+            // --- Active Voice Streaming Mode ---
             AudioChunk chunk;
             memcpy(chunk.data, dma_buffer, bytes_read);
             chunk.length = bytes_read;
@@ -277,12 +309,12 @@ void TaskAudioKWS(void *pvParameters) {
                 t_last_sound = now;
             }
 
-            // Check for silence timeout (1.2s trailing silence)
+            // Silence Cutoff Check (1.2s trailing silence)
             if ((now - t_last_sound) / 1000 > SILENCE_TIMEOUT_MS) {
                 chunk.is_last = true;
                 is_streaming = false;
                 xQueueSend(audio_queue, &chunk, portMAX_DELAY);
-                vTaskDelay(pdMS_TO_TICKS(1500)); // 1.5s lockout cooldown
+                vTaskDelay(pdMS_TO_TICKS(1500)); // Lockout cooldown
             } else {
                 chunk.is_last = false;
                 xQueueSend(audio_queue, &chunk, portMAX_DELAY);
@@ -297,13 +329,14 @@ void TaskAudioKWS(void *pvParameters) {
 void setup() {
     Serial.begin(115200);
     screen_mutex = xSemaphoreCreateMutex();
-    audio_queue = xQueueCreate(16, sizeof(AudioChunk)); // Queue depth of 16 chunks
+    audio_queue = xQueueCreate(16, sizeof(AudioChunk));
 
     init_fast_oled();
     init_i2s_dma();
 
-    // Connect to WiFi
+    // Connect to WiFi & Disable Modem Sleep Latency Spikes
     WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false); // Disables Wi-Fi modem sleep latency spikes
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     Serial.print(F("Connecting WiFi"));
     while (WiFi.status() != WL_CONNECTED) {
@@ -312,15 +345,14 @@ void setup() {
     }
     Serial.println(F("\n✅ ESP32-S3 Ready! IP: ") + WiFi.localIP().toString());
 
-    // Pin Tasks to Dual Cores
-    // Core 0: Dedicated Network TCP Task
+    // Dual-Core Task Pinning
+    // Core 0: Dedicated TCP Socket, Wi-Fi Stack, OLED Telemetry Task
     xTaskCreatePinnedToCore(TaskNetworkStream, "NetTask", 4096, NULL, 2, NULL, 0);
 
-    // Core 1: Dedicated Audio DMA & TinyML Task
+    // Core 1: Dedicated I2S DMA Read, Pre-Roll Ring Buffer & TinyML KWS Task
     xTaskCreatePinnedToCore(TaskAudioKWS, "AudioKWSTask", 8192, NULL, 3, NULL, 1);
 }
 
 void loop() {
-    // Empty: Core 0 and Core 1 are handled entirely by dedicated FreeRTOS tasks
     vTaskDelete(NULL);
 }

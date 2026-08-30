@@ -88,11 +88,29 @@ stats = {
 request_history = []
 lock = threading.Lock()
 
+# Protocol Opcodes
+PROTOCOL_HEARTBEAT = 0x00
+PROTOCOL_SYN = 0x01
+PROTOCOL_SYN_ACK = 0x06
+PROTOCOL_AUDIO_CHUNK = 0x02
+PROTOCOL_STREAM_END = 0xFF
+PROTOCOL_TRANSIT_ACK = 0x7F
+
 # Load Whisper Model
 whisper_engine = None
 if HAS_FASTER_WHISPER:
     try:
         whisper_engine = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type=COMPUTE_TYPE, cpu_threads=CPU_THREADS)
+        # Dummy Warm-Up Inference (Eliminates Cold Start Latency Spike)
+        dummy_audio = np.zeros(16000, dtype=np.float32)
+        _ = whisper_engine.transcribe(
+            dummy_audio,
+            beam_size=1,
+            best_of=1,
+            condition_on_previous_text=False,
+            temperature=0.0,
+            vad_filter=False
+        )
     except Exception:
         whisper_engine = None
 
@@ -106,8 +124,6 @@ def get_local_ips():
     except Exception:
         pass
     return ips if ips else ["127.0.0.1"]
-
-PROTOCOL_AUDIO_CHUNK = 0x02
 
 def handle_client(client_sock, client_addr):
     client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -129,6 +145,10 @@ def handle_client(client_sock, client_addr):
                 break
 
             opcode = opcode_byte[0]
+
+            if opcode == PROTOCOL_HEARTBEAT:
+                # Idle TCP Keepalive Ping
+                continue
 
             if opcode == PROTOCOL_SYN:
                 is_protocol = True
