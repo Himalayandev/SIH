@@ -440,17 +440,44 @@ def generate_dashboard():
         padding=(1, 2)
     )
 
+    # 4. Security & Connection Authorization Panel
+    auth_text = Text()
+    auth_text.append("Authorization Mode: ", style=TEXT_SUBDUED)
+    auth_text.append(f"{AUTH_MODE.upper()}\n", style="bold yellow" if AUTH_MODE == "prompt" else TEXT_PRIMARY)
+    
+    auth_text.append("Whitelisted IPs   : ", style=TEXT_SUBDUED)
+    auth_text.append(f"{', '.join(authorized_ips)}\n", style=TEXT_PRIMARY)
+    
+    pending_ip = stats.get("pending_auth_ip")
+    if pending_ip:
+        auth_text.append("⚠️ PENDING ACCESS REQUEST: ", style="bold yellow")
+        auth_text.append(f"Client {pending_ip} requests server connection!\n", style="bold red")
+        auth_text.append("Press [Y] in terminal to Accept | [N] to Deny", style="bold green")
+    else:
+        auth_text.append("Pending Requests  : ", style=TEXT_SUBDUED)
+        auth_text.append("None (All connected devices authorized)", style=STATUS_GREEN)
+
+    panel_auth = Panel(
+        auth_text,
+        title=" 🔐 CLIENT CONNECTION SECURITY & AUTHORIZATION ",
+        title_align="left",
+        border_style="yellow" if pending_ip else BORDER_COLOR,
+        box=box.ROUNDED,
+        padding=(1, 2)
+    )
+
     layout = Layout()
     layout.split_column(
-        Layout(name="top_panels", size=10),
-        Layout(panel_table, name="bottom_table")
+        Layout(name="top_panels", size=9),
+        Layout(name="auth_panel", size=6),
+        Layout(name="table_panel")
     )
-    
     layout["top_panels"].split_row(
         Layout(panel_status, ratio=1),
         Layout(panel_metrics, ratio=1)
     )
-
+    layout["auth_panel"].update(panel_auth)
+    layout["table_panel"].update(panel_table)
     return layout
 
 def main():
