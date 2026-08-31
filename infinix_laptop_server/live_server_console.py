@@ -50,6 +50,7 @@ COMPUTE_TYPE = "int8"
 CPU_THREADS = 4
 BEAM_SIZE = 1
 
+cfg = {}
 if os.path.exists(CONFIG_PATH):
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -141,6 +142,15 @@ def get_local_ips():
         pass
     return ips if ips else ["127.0.0.1"]
 
+def recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
 def handle_client(client_sock, client_addr):
     client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     client_sock.settimeout(60.0) # Persistent pre-warmed idle connection timeout
@@ -151,10 +161,8 @@ def handle_client(client_sock, client_addr):
 
         while True:
             try:
-                opcode_byte = client_sock.recv(1)
-            except socket.timeout:
-                break
-            except Exception:
+                opcode_byte = recv_exact(client_sock, 1)
+            except (socket.timeout, Exception):
                 break
 
             if not opcode_byte:
@@ -185,10 +193,9 @@ def handle_client(client_sock, client_addr):
                 
                 # Send PENDING byte to client
                 client_sock.sendall(bytes([PROTOCOL_SYN_PENDING]))
-                print(f"\n⚠️  [SECURITY PROMPT] Client '{ip}' requests connection access! Authorizing automatically for whitelisted session...")
+                print(f"\n⚠️  [SECURITY PROMPT] Client '{ip}' requests connection access! Waiting for admin authorization [Y/N]...")
                 
-                # Auto-approve local/internal requests or wait up to 10s
-                authorize_ip(ip, approve=True)
+                # Wait up to 10s for admin approval in TUI
                 evt.wait(timeout=10.0)
 
                 with lock:
@@ -206,22 +213,19 @@ def handle_client(client_sock, client_addr):
 
             elif opcode == PROTOCOL_AUDIO_CHUNK:
                 # Length-Prefixed TLV Frame: Read 2-byte N (payload length)
-                len_bytes = client_sock.recv(2)
-                if len(len_bytes) < 2:
+                len_bytes = recv_exact(client_sock, 2)
+                if not len_bytes or len(len_bytes) < 2:
                     break
                 payload_len = struct.unpack("<H", len_bytes)[0]
 
-                chunk_data = b""
-                while len(chunk_data) < payload_len:
-                    more = client_sock.recv(payload_len - len(chunk_data))
-                    if not more:
-                        break
-                    chunk_data += more
+                chunk_data = recv_exact(client_sock, payload_len)
+                if chunk_data is None:
+                    break
 
                 pcm_chunks.append(chunk_data)
 
             elif opcode == PROTOCOL_STREAM_END:
-                len_bytes = client_sock.recv(2) # Consume 2-byte length if present
+                _ = recv_exact(client_sock, 2) # Consume 2-byte length if present
                 client_sock.sendall(bytes([PROTOCOL_TRANSIT_ACK]))
 
                 raw_bytes = b"".join(pcm_chunks)
@@ -312,28 +316,6 @@ def handle_client(client_sock, client_addr):
                 if not raw_data:
                     break
                 pcm_chunks.append(raw_data)
-
-        timestamp = time.strftime("%H:%M:%S")
-        lang_label = "Hindi (hi)" if detected_lang == "hi" else ("English (en)" if detected_lang == "en" else detected_lang.upper())
-
-        with lock:
-            stats["total_requests"] += 1
-            stats["last_client_ip"] = client_addr[0]
-            stats["last_lang"] = lang_label
-            stats["last_text"] = transcribed_text if transcribed_text else "(empty)"
-            stats["last_duration_ms"] = audio_dur_ms
-            stats["last_latency_ms"] = asr_compute_ms
-
-            request_history.insert(0, {
-                "time": timestamp,
-                "ip": client_addr[0],
-                "lang": lang_label,
-                "dur_ms": audio_dur_ms,
-                "asr_ms": asr_compute_ms,
-                "text": transcribed_text if transcribed_text else "(empty)"
-            })
-            if len(request_history) > 10:
-                request_history.pop()
 
     except Exception:
         pass

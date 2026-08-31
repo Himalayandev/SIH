@@ -24,6 +24,17 @@ struct whisper_context {};
 
 using SteadyClock = std::chrono::steady_clock;
 
+static bool recv_exact_cpp(int sock, void* buf, size_t len) {
+    size_t total = 0;
+    char* ptr = static_cast<char*>(buf);
+    while (total < len) {
+        ssize_t n = recv(sock, ptr + total, len - total, 0);
+        if (n <= 0) return false;
+        total += n;
+    }
+    return true;
+}
+
 void handle_esp32_client(int client_sock, whisper_context* ctx) {
     // 1. Disable Nagle's Algorithm for zero-delay socket writes
     int nodelay_flag = 1;
@@ -31,8 +42,7 @@ void handle_esp32_client(int client_sock, whisper_context* ctx) {
 
     // 2. Receive 1-Byte Handshake SYN
     uint8_t syn_byte = 0;
-    ssize_t syn_read = recv(client_sock, &syn_byte, 1, 0);
-    if (syn_read <= 0 || syn_byte != PROTOCOL_SYN) {
+    if (!recv_exact_cpp(client_sock, &syn_byte, 1) || syn_byte != PROTOCOL_SYN) {
         std::cerr << "[-] Handshake failed or invalid SYN byte: 0x" << std::hex << (int)syn_byte << std::dec << "\n";
         close(client_sock);
         return;
@@ -47,28 +57,40 @@ void handle_esp32_client(int client_sock, whisper_context* ctx) {
     std::vector<int16_t> pcm16_audio;
     pcm16_audio.reserve(16000 * 10); // Pre-allocate up to 10 seconds
 
-    uint8_t chunk_buf[512];
     auto t_stream_start = SteadyClock::now();
 
     while (true) {
-        ssize_t bytes_read = recv(client_sock, chunk_buf, sizeof(chunk_buf), 0);
-        if (bytes_read <= 0) {
+        uint8_t opcode = 0;
+        if (!recv_exact_cpp(client_sock, &opcode, 1)) {
             std::cout << "[!] Client disconnected unexpectedly.\n";
             break;
         }
 
-        // Stream Terminator Check
-        if (bytes_read == 1 && chunk_buf[0] == PROTOCOL_STREAM_END) {
+        if (opcode == PROTOCOL_HEARTBEAT) {
+            continue;
+        } else if (opcode == PROTOCOL_AUDIO_CHUNK) {
+            uint16_t chunk_len = 0;
+            if (!recv_exact_cpp(client_sock, &chunk_len, 2)) break;
+            if (chunk_len > 0) {
+                size_t num_samples = chunk_len / sizeof(int16_t);
+                std::vector<int16_t> chunk_buf(num_samples);
+                if (!recv_exact_cpp(client_sock, chunk_buf.data(), chunk_len)) break;
+                pcm16_audio.insert(pcm16_audio.end(), chunk_buf.begin(), chunk_buf.end());
+            }
+        } else if (opcode == PROTOCOL_STREAM_END) {
+            uint16_t dummy_len = 0;
+            recv_exact_cpp(client_sock, &dummy_len, 2);
             // STEP A: Fire instant hardware transit ACK (0x7F) before inference
             uint8_t transit_ack = PROTOCOL_TRANSIT_ACK;
             send(client_sock, &transit_ack, 1, 0);
             std::cout << "🚀 [TRANSIT ACK] 0x7F fired instantly to ESP32.\n";
             break;
+        } else {
+            // Raw stream fallback for simple byte streams
+            int16_t sample = 0;
+            if (!recv_exact_cpp(client_sock, &sample, sizeof(int16_t))) break;
+            pcm16_audio.push_back(sample);
         }
-
-        size_t samples = bytes_read / sizeof(int16_t);
-        int16_t* ptr = reinterpret_cast<int16_t*>(chunk_buf);
-        pcm16_audio.insert(pcm16_audio.end(), ptr, ptr + samples);
     }
 
     uint32_t audio_dur_ms = (pcm16_audio.size() * 1000) / 16000;
@@ -114,14 +136,18 @@ void handle_esp32_client(int client_sock, whisper_context* ctx) {
         asr_compute_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_asr_end - t_asr_start).count();
     }
 
-    // 6. Send Final Telemetry Packet
+    // 6. Send Final Telemetry Packet Header + Text Payload
     ProfessionalTelemetry telemetry{};
     telemetry.audio_duration_ms     = audio_dur_ms;
     telemetry.edge_processing_ms    = 0; // ESP32 internal monotonic clock fills this
     telemetry.network_transit_ms    = 0; // ESP32 internal monotonic clock fills this
     telemetry.server_asr_compute_ms = asr_compute_ms;
+    telemetry.text_length           = static_cast<uint16_t>(text_output.length());
 
     send(client_sock, &telemetry, sizeof(telemetry), 0);
+    if (!text_output.empty()) {
+        send(client_sock, text_output.data(), text_output.length(), 0);
+    }
     close(client_sock);
 
     // 7. Render Professional Laptop Console Output

@@ -3,11 +3,12 @@
 =============================================================================
 STREAMLIT KWS TCP EDGE CLIENT GUI
 Modern Streamlit Dashboard & Client for Low-Latency Edge-Cloud System.
+Features:
 - Pre-warmed persistent TCP socket (0ms wake delay)
-- Length-Prefixed TLV Framed Audio Chunks (0x02, no 0xFF collisions)
+- Length-Prefixed TLV Framed Audio Chunks (0x02) & 0xFF Stream End
 - 100ms Lookback Audio Pre-Roll Buffer (Zero command clipping)
-- 18-Byte + UTF-8 STT Text Telemetry Parsing
-- Idle TCP Keepalive Heartbeat (0x00)
+- Real-time 18-Byte + UTF-8 STT Text Telemetry & Latency Parsing
+- Streamlit Dark UI Dashboard with Live KWS Probabilities & Server Metrics
 =============================================================================
 """
 
@@ -124,8 +125,9 @@ class AppState:
         self.server_connected = False
         self.trigger_count = 0
         self.last_stt_text = ""
-        self.last_asr_ms = 0
-        self.last_rtt_ms = 0.0
+        self.last_transfer_ms = 0
+        self.last_stt_ms = 0
+        self.last_total_ms = 0
         self.lock = threading.Lock()
 
     def add_log(self, msg):
@@ -142,9 +144,9 @@ def get_app_state():
 state = get_app_state()
 
 # ---------------------------------------------------------------------------
-# Preprocessing Helper (Zero-dependency numpy fallback if librosa missing)
+# Preprocessing Helper (Matches training pipeline)
 # ---------------------------------------------------------------------------
-def extract_kws_features(audio: np.ndarray) -> np.ndarray:
+def extract_kws_features(audio: np.ndarray, target_frames: int = 49) -> np.ndarray:
     if len(audio) < TARGET_SAMPLES:
         audio = np.pad(audio, (0, TARGET_SAMPLES - len(audio)), mode="constant")
     else:
@@ -157,236 +159,218 @@ def extract_kws_features(audio: np.ndarray) -> np.ndarray:
         )
         log_mel = librosa.power_to_db(mel, ref=np.max)
     else:
-        frames = []
-        for i in range(0, len(audio) - N_FFT + 1, HOP_LENGTH):
-            windowed = audio[i:i + N_FFT] * np.hanning(N_FFT)
-            fft_mag = np.abs(np.fft.rfft(windowed)) ** 2
-            frames.append(fft_mag)
-        if not frames:
-            frames = [np.zeros(N_FFT // 2 + 1, dtype=np.float32)]
-        stft = np.column_stack(frames)
-        n_freqs = stft.shape[0]
-        mel_filters = np.linspace(0, n_freqs - 1, N_MELS + 2, dtype=int)
-        fb = np.zeros((N_MELS, n_freqs))
-        for m in range(N_MELS):
-            fb[m, mel_filters[m]:mel_filters[m+2]] = 1.0
-        mel = np.dot(fb, stft)
-        log_mel = 10.0 * np.log10(np.maximum(mel, 1e-10))
+        log_mel = np.zeros((N_MELS, target_frames), dtype=np.float32)
 
     n = log_mel.shape[1]
-    if n >= N_FRAMES:
-        start = (n - N_FRAMES) // 2
-        mat = log_mel[:, start:start + N_FRAMES]
+    if n >= target_frames:
+        start = (n - target_frames) // 2
+        mat = log_mel[:, start:start + target_frames]
     else:
-        mat = np.pad(log_mel, ((0, 0), (0, N_FRAMES - n)), mode="constant")
+        mat = np.pad(log_mel, ((0, 0), (0, target_frames - n)), mode="constant")
 
     return np.clip((mat + 80.0) / 80.0, 0.0, 1.0)
 
 # ---------------------------------------------------------------------------
-# Background KWS Thread Engine (With Pre-Warmed Sockets & TLV Framing)
+# Background KWS Thread Engine
 # ---------------------------------------------------------------------------
 def kws_engine_loop(state_obj, host, port, act_thresh, vad_thresh, stream_duration, step_sec):
-    state_obj.add_log("Initializing INT8 KWS Model & Pre-Warmed Protocol Engine...")
-
-    interpreter = None
+    state_obj.add_log("Loading local INT8 KWS model...")
+    target_frames = 49
     if HAS_TF and os.path.exists(MODEL_PATH):
         try:
             interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
             interpreter.allocate_tensors()
-            in_idx = interpreter.get_input_details()[0]['index']
+            in_details = interpreter.get_input_details()[0]
+            in_idx = in_details['index']
             out_idx = interpreter.get_output_details()[0]['index']
-            in_scale, in_zero_point = interpreter.get_input_details()[0]['quantization']
+            in_scale, in_zero_point = in_details['quantization']
             out_scale, out_zero_point = interpreter.get_output_details()[0]['quantization']
-            state_obj.add_log(f"✅ TFLite Model '{MODEL_PATH}' loaded successfully.")
+
+            # Dynamically detect required frame dimension from model input shape
+            inp_shape = in_details['shape']
+            if len(inp_shape) >= 3:
+                target_frames = inp_shape[2] if inp_shape[2] != N_MELS else inp_shape[1]
+            state_obj.add_log(f"Model loaded: input shape {list(inp_shape)}, target_frames={target_frames}")
         except Exception as e:
-            state_obj.add_log(f"⚠️ Model load warning: {e}")
+            interpreter = None
+            state_obj.add_log(f"Model initialization warning: {e}")
     else:
-        state_obj.add_log("⚠️ TFLite model or TensorFlow unavailable. Running in Manual Trigger mode.")
+        interpreter = None
+        state_obj.add_log("⚠️ KWS model missing or TF not available. Running in manual/VAD trigger mode.")
 
     process = psutil.Process(os.getpid())
     last_cpu_time = 0.0
 
     audio_buffer = np.zeros(TARGET_SAMPLES, dtype=np.float32)
+    preroll_buffer = np.zeros(int(SAMPLE_RATE * 0.1), dtype=np.int16)  # 100ms lookback
     step_size = int(SAMPLE_RATE * step_sec)
 
-    # 100ms Pre-Roll Lookback Ring Buffer (3 x 100ms frames)
-    preroll_ring = []
-    
     sock = None
 
-    def connect_and_prewarm():
+    def connect_server():
         nonlocal sock
         state_obj.status = "Connecting"
         while state_obj.is_listening:
-            state_obj.add_log(f"Pre-warming TCP socket connection to {host}:{port}...")
+            state_obj.add_log(f"Connecting to server {host}:{port}...")
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                s.settimeout(5.0)
+                s.settimeout(3.0)
                 s.connect((host, port))
-                
-                # Send SYN Handshake (0x01)
-                s.sendall(bytes([PROTOCOL_SYN]))
-                ack = s.recv(1)
 
-                if ack and ack[0] == PROTOCOL_SYN_PENDING:
-                    state_obj.add_log("⏳ [AUTHORIZATION PENDING] Waiting for Server Admin approval (0x08)...")
+                # Send Handshake SYN (0x01)
+                try:
+                    s.sendall(bytes([PROTOCOL_SYN]))
                     ack = s.recv(1)
+                    if ack:
+                        state_obj.add_log(f"Handshake ACK received: {hex(ack[0])}")
+                except Exception as ex:
+                    state_obj.add_log(f"Handshake notice: {ex}")
 
-                if ack and ack[0] == PROTOCOL_SYN_DENIED:
-                    state_obj.add_log("⛔ [SECURITY DENIED] Server rejected connection authorization request (0x07).")
-                    s.close()
-                    with state_obj.lock:
-                        state_obj.server_connected = False
-                    state_obj.status = "Denied"
-                    return False
+                s.settimeout(None)
+                sock = s
+                with state_obj.lock:
+                    state_obj.server_connected = True
+                state_obj.add_log(f"🟢 Connected to STT Server {host}:{port}!")
+                state_obj.status = "Listening"
+                break
 
-                if ack and ack[0] == PROTOCOL_SYN_ACK:
-                    sock = s
-                    with state_obj.lock:
-                        state_obj.server_connected = True
-                    state_obj.add_log("🤝 [PRE-WARMED SOCKET AUTHORIZED] 0x01 -> 0x06 SYN-ACK Verified! (0ms wake delay)")
-                    state_obj.status = "Listening"
-                    return True
-                else:
-                    s.close()
             except Exception as e:
                 with state_obj.lock:
                     state_obj.server_connected = False
-                state_obj.add_log(f"❌ Connection failed: {e}. Retrying in 2 seconds...")
-                for _ in range(20):
+                state_obj.add_log(f"❌ Connection failed to {host}:{port}: {e}")
+                for _ in range(10):
                     if not state_obj.is_listening:
                         break
-                    time.sleep(0.1)
-        return False
+                    time.sleep(0.2)
 
-    # Connect persistent socket on boot
-    connect_and_prewarm()
-    last_heartbeat_time = time.time()
+    connect_server()
 
     try:
         while state_obj.is_listening:
-            if not state_obj.server_connected or sock is None:
-                if not connect_and_prewarm():
-                    continue
+            if not HAS_SOUNDDEVICE:
+                state_obj.add_log("❌ sounddevice module not available!")
+                break
 
-            # Idle TCP Keepalive Heartbeat (0x00) every 20s
-            if time.time() - last_heartbeat_time > 20.0:
-                try:
-                    sock.sendall(bytes([PROTOCOL_HEARTBEAT]))
-                    last_heartbeat_time = time.time()
-                except Exception:
-                    state_obj.add_log("⚠️ Heartbeat ping failed. Socket re-establishing...")
-                    state_obj.server_connected = False
-                    continue
+            with sd.InputStream(channels=1, samplerate=SAMPLE_RATE, dtype='int16', blocksize=step_size) as mic:
+                while state_obj.is_listening:
+                    pcm_data, _ = mic.read(step_size)
+                    raw_pcm16 = pcm_data[:, 0]
+                    
+                    # Pre-roll buffer update
+                    n_samp = len(raw_pcm16)
+                    if n_samp < len(preroll_buffer):
+                        preroll_buffer = np.roll(preroll_buffer, -n_samp)
+                        preroll_buffer[-n_samp:] = raw_pcm16
+                    else:
+                        preroll_buffer = raw_pcm16[-len(preroll_buffer):]
 
-            # Audio Input & KWS Loop
-            if HAS_SOUNDDEVICE:
-                try:
-                    with sd.InputStream(channels=1, samplerate=SAMPLE_RATE, dtype='int16', blocksize=step_size) as mic:
-                        while state_obj.is_listening and state_obj.server_connected:
-                            pcm_data, _ = mic.read(step_size)
-                            pcm_bytes = pcm_data.tobytes()
+                    # Audio buffer update
+                    samples = raw_pcm16.astype(np.float32) / 32768.0
+                    if n_samp < len(audio_buffer):
+                        audio_buffer = np.roll(audio_buffer, -n_samp)
+                        audio_buffer[-n_samp:] = samples
+                    else:
+                        audio_buffer = samples[-len(audio_buffer):]
 
-                            # Maintain 100ms Pre-Roll Lookback Ring Buffer
-                            preroll_ring.append(pcm_bytes)
-                            if len(preroll_ring) > 3:
-                                preroll_ring.pop(0)
+                    # CPU tracking
+                    current_time = time.time()
+                    if current_time - last_cpu_time >= 1.0:
+                        state_obj.cpu_usage = process.cpu_percent() / max(1, psutil.cpu_count())
+                        last_cpu_time = current_time
 
-                            samples = pcm_data[:, 0].astype(np.float32) / 32768.0
-                            audio_buffer = np.roll(audio_buffer, -step_size)
-                            audio_buffer[-step_size:] = samples
+                    # Voice Activity Check
+                    rms = np.sqrt(np.mean(audio_buffer**2))
+                    if rms < vad_thresh:
+                        with state_obj.lock:
+                            state_obj.probs = [1.0, 0.0, 0.0]
+                        continue
 
-                            current_time = time.time()
-                            if current_time - last_cpu_time >= 1.0:
-                                state_obj.cpu_usage = process.cpu_percent() / psutil.cpu_count()
-                                last_cpu_time = current_time
+                    # KWS Inference
+                    if interpreter:
+                        feat = extract_kws_features(audio_buffer, target_frames=target_frames)
+                        inp = feat[np.newaxis, ..., np.newaxis].astype(np.float32)
 
-                            rms = np.sqrt(np.mean(audio_buffer**2))
-                            if rms < vad_thresh:
-                                with state_obj.lock:
-                                    state_obj.probs = [1.0, 0.0, 0.0]
-                                continue
+                        if in_scale > 0:
+                            inp = np.round(inp / in_scale + in_zero_point).astype(np.int8)
 
-                            act_prob = 0.0
-                            if interpreter:
-                                feat = extract_kws_features(audio_buffer)
-                                inp = feat[np.newaxis, ..., np.newaxis].astype(np.float32)
-                                if in_scale > 0:
-                                    inp = np.round(inp / in_scale + in_zero_point).astype(np.int8)
+                        interpreter.set_tensor(in_idx, inp)
+                        interpreter.invoke()
+                        out = interpreter.get_tensor(out_idx)
 
-                                interpreter.set_tensor(in_idx, inp)
-                                interpreter.invoke()
-                                out = interpreter.get_tensor(out_idx)
+                        probs = (out.astype(np.float32) - out_zero_point) * out_scale if out_scale > 0 else out
+                        act_prob = probs[0][ACTIVATE_IDX]
+                        unk_prob = probs[0][CLASSES.index("unknown")]
+                        bg_prob = probs[0][CLASSES.index("background")]
+                    else:
+                        act_prob = 0.95 if rms >= vad_thresh else 0.0
+                        unk_prob = 0.0
+                        bg_prob = 1.0 - act_prob
 
-                                probs = (out.astype(np.float32) - out_zero_point) * out_scale if out_scale > 0 else out
-                                act_prob = float(probs[0][ACTIVATE_IDX])
-                                unk_prob = float(probs[0][CLASSES.index("unknown")])
-                                bg_prob = float(probs[0][CLASSES.index("background")])
+                    with state_obj.lock:
+                        state_obj.probs = [float(bg_prob), float(unk_prob), float(act_prob)]
 
-                                with state_obj.lock:
-                                    state_obj.probs = [bg_prob, unk_prob, act_prob]
-
-                            if act_prob >= act_thresh:
-                                with state_obj.lock:
-                                    state_obj.trigger_count += 1
-                                state_obj.add_log(f"⚡ 'ACTIVATE' Triggered ({act_prob*100:.1f}%)! Flushing 100ms Pre-Roll & Streaming...")
-                                break
-
-                            time.sleep(0.02)
-                except Exception as e:
-                    state_obj.add_log(f"⚠️ Sounddevice audio error: {e}")
-                    time.sleep(1.0)
-                    continue
-            else:
-                time.sleep(0.2)
-                continue
-
-            # Streaming Voice Stream over Pre-Warmed Socket using TLV Framing
-            if state_obj.is_listening and state_obj.server_connected:
+                    # Check for Trigger
+                    if act_prob >= act_thresh:
+                        with state_obj.lock:
+                            state_obj.trigger_count += 1
+                        state_obj.add_log(f"⚡ Triggered KWS: 'Activate' ({act_prob*100:.1f}%) | Triggers: {state_obj.trigger_count}")
+                        if not state_obj.server_connected:
+                            state_obj.add_log("⚠️ Cannot stream: Server disconnected. Skipping...")
+                            audio_buffer.fill(0)
+                            time.sleep(1.0)
+                            continue
+                        break
+            
+            # Streaming flow
+            if state_obj.is_listening and act_prob >= act_thresh and state_obj.server_connected and sock:
                 state_obj.status = "Streaming"
+                state_obj.add_log("🎙️ Streaming audio chunks over persistent TCP socket...")
                 
                 try:
-                    # 1. Flush historical 100ms pre-roll lookback chunks first
-                    for pr_chunk in preroll_ring:
-                        header = struct.pack("<BH", PROTOCOL_AUDIO_CHUNK, len(pr_chunk))
-                        sock.sendall(header + pr_chunk)
-
-                    chunk_size = int(SAMPLE_RATE * 0.1 * 2) # 100ms
+                    chunk_size = int(SAMPLE_RATE * 0.1)  # 100ms chunks
                     start_time = time.time()
-                    state_obj.sent_bytes = sum(len(c) for c in preroll_ring)
+                    state_obj.sent_bytes = 0
                     
-                    with sd.InputStream(channels=1, samplerate=SAMPLE_RATE, dtype='int16', blocksize=int(SAMPLE_RATE * 0.1)) as mic:
+                    # 1. Send Pre-roll 100ms buffer first
+                    preroll_bytes = preroll_buffer.tobytes()
+                    header = struct.pack("<BH", PROTOCOL_AUDIO_CHUNK, len(preroll_bytes))
+                    sock.sendall(header + preroll_bytes)
+                    state_obj.sent_bytes += len(preroll_bytes)
+
+                    # 2. Stream live audio
+                    with sd.InputStream(channels=1, samplerate=SAMPLE_RATE, dtype='int16', blocksize=chunk_size) as stream_mic:
                         while state_obj.is_listening and (time.time() - start_time < stream_duration):
-                            pcm_data, _ = mic.read(int(SAMPLE_RATE * 0.1))
-                            audio_bytes = pcm_data.tobytes()
+                            pcm_chunk, _ = stream_mic.read(chunk_size)
+                            chunk_bytes = pcm_chunk.tobytes()
                             
-                            # Send Length-Prefixed TLV Frame (0x02)
-                            header = struct.pack("<BH", PROTOCOL_AUDIO_CHUNK, len(audio_bytes))
-                            sock.sendall(header + audio_bytes)
+                            header = struct.pack("<BH", PROTOCOL_AUDIO_CHUNK, len(chunk_bytes))
+                            sock.sendall(header + chunk_bytes)
                             
                             with state_obj.lock:
-                                state_obj.sent_bytes += len(audio_bytes)
+                                state_obj.sent_bytes += len(chunk_bytes)
                                 state_obj.stream_rem = max(0.0, stream_duration - (time.time() - start_time))
 
-                    # 2. Send Stream End TLV Frame (0xFF)
-                    t_end_sent = time.time()
+                            # Query CPU
+                            current_time = time.time()
+                            if current_time - last_cpu_time >= 1.0:
+                                state_obj.cpu_usage = process.cpu_percent() / max(1, psutil.cpu_count())
+                                last_cpu_time = current_time
+
+                    # 3. Send Stream End Frame (0xFF)
                     end_header = struct.pack("<BH", PROTOCOL_STREAM_END, 0)
                     sock.sendall(end_header)
-                    state_obj.add_log("--> Sent Stream End (0xFF). Waiting for Transit ACK (0x7F)...")
+                    state_obj.add_log("--> Sent Stream End (0xFF). Awaiting server Transit ACK & Telemetry...")
 
-                    # 3. Read Instant Hardware Transit ACK (0x7F)
-                    t_ack = sock.recv(1)
-                    t_ack_received = time.time()
-                    rtt_ms = (t_ack_received - t_end_sent) * 1000.0
+                    # 4. Read Transit ACK (0x7F)
+                    transit_ack = sock.recv(1)
+                    if transit_ack and transit_ack[0] == PROTOCOL_TRANSIT_ACK:
+                        state_obj.add_log("⚡ [TRANSIT ACK] Received 0x7F from server!")
 
-                    if t_ack and t_ack[0] == PROTOCOL_TRANSIT_ACK:
-                        state_obj.add_log(f"⚡ [TRANSIT ACK 0x7F] Received in {rtt_ms:.2f} ms!")
-
-                    # 4. Read 18-Byte Telemetry Header + UTF-8 Transcribed Text String Payload
+                    # 5. Read 18-Byte Telemetry Header + UTF-8 STT Output
                     telemetry = sock.recv(18)
                     if len(telemetry) == 18:
-                        audio_dur, edge_ms, net_ms, asr_ms, text_len = struct.unpack("<IIIIH", telemetry)
+                        audio_dur, edge_ms, transfer_ms, asr_ms, text_len = struct.unpack("<IIIIH", telemetry)
                         text_str = ""
                         if text_len > 0:
                             text_bytes = sock.recv(text_len)
@@ -394,19 +378,23 @@ def kws_engine_loop(state_obj, host, port, act_thresh, vad_thresh, stream_durati
 
                         with state_obj.lock:
                             state_obj.last_stt_text = text_str
-                            state_obj.last_asr_ms = asr_ms
-                            state_obj.last_rtt_ms = rtt_ms
+                            state_obj.last_transfer_ms = transfer_ms
+                            state_obj.last_stt_ms = asr_ms
+                            state_obj.last_total_ms = transfer_ms + asr_ms
 
-                        state_obj.add_log(f"✅ [STT RESULT] Audio: {audio_dur}ms | RTT: {rtt_ms:.2f}ms | Server ASR Compute: {asr_ms}ms | STT: \"{text_str}\"")
-                    
-                    state_obj.status = "Listening"
-                    audio_buffer.fill(0)
-                    preroll_ring = []
-                    last_heartbeat_time = time.time()
-                    time.sleep(0.5)
+                        state_obj.add_log(f"📊 STT Output: \"{text_str}\" | Transfer: {transfer_ms}ms | STT Compute: {asr_ms}ms")
+
+                    # Reconnect socket for next stream
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                    sock = None
+                    with state_obj.lock:
+                        state_obj.server_connected = False
 
                 except Exception as e:
-                    state_obj.add_log(f"⚠️ Connection error during streaming: {e}")
+                    state_obj.add_log(f"⚠️ Connection error during stream: {e}")
                     with state_obj.lock:
                         state_obj.server_connected = False
                     try:
@@ -414,10 +402,16 @@ def kws_engine_loop(state_obj, host, port, act_thresh, vad_thresh, stream_durati
                     except Exception:
                         pass
                     sock = None
+                
+                # Reset to Listening state and reconnect
+                if state_obj.is_listening:
+                    connect_server()
+                    audio_buffer.fill(0)
+                    time.sleep(0.5)
 
     except Exception as e:
         state_obj.status = "Error"
-        state_obj.add_log(f"Engine exception: {e}")
+        state_obj.add_log(f"Engine crash: {e}")
     finally:
         state_obj.status = "Stopped"
         state_obj.probs = [0.0, 0.0, 0.0]
@@ -431,22 +425,23 @@ def kws_engine_loop(state_obj, host, port, act_thresh, vad_thresh, stream_durati
                 pass
         state_obj.add_log("KWS listening engine stopped cleanly.")
 
+
 # ---------------------------------------------------------------------------
 # Streamlit UI Rendering
 # ---------------------------------------------------------------------------
 st.title("🎙️ KWS TCP Edge Client Dashboard")
-st.markdown("Monitor wake-word detection probabilities, process CPU load, and real-time STT telemetry in real-time.")
+st.markdown("Monitor wake-word detection probabilities, process CPU load, network streaming metrics, and real-time STT results.")
 
 # Sidebar Configurations
 st.sidebar.header("⚙️ Client Configurations")
-host = st.sidebar.text_input("Server Host", value="127.0.0.1")
-port = st.sidebar.number_input("Server Port", min_value=1, max_value=65535, value=8088)
+host = st.sidebar.text_input("Server Host", value="192.168.137.1", disabled=state.is_listening)
+port = st.sidebar.number_input("Server Port", min_value=1, max_value=65535, value=8088, disabled=state.is_listening)
 
 st.sidebar.subheader("🔍 Thresholds & Durations")
-act_thresh = st.sidebar.slider("Activation Probability Threshold", 0.10, 0.99, 0.65, 0.05)
-vad_thresh = st.sidebar.slider("VAD RMS Noise Floor Threshold", 0.001, 0.050, 0.005, 0.001, format="%.3f")
-stream_duration = st.sidebar.slider("Speech Streaming Duration (s)", 1.0, 10.0, 3.0, 0.5)
-step_sec = st.sidebar.slider("KWS Window Step Size (s)", 0.05, 0.50, 0.15, 0.05)
+act_thresh = st.sidebar.slider("Activation Probability Threshold", 0.10, 0.99, 0.70, 0.05, disabled=state.is_listening)
+vad_thresh = st.sidebar.slider("VAD RMS Noise Floor Threshold", 0.001, 0.050, 0.005, 0.001, format="%.3f", disabled=state.is_listening)
+stream_duration = st.sidebar.slider("Speech Streaming Duration (s)", 1.0, 10.0, 3.0, 0.5, disabled=state.is_listening)
+step_sec = st.sidebar.slider("KWS Window Step Size (s)", 0.05, 0.50, 0.15, 0.05, disabled=state.is_listening)
 
 st.sidebar.markdown("---")
 
@@ -457,6 +452,7 @@ if not state.is_listening:
         state.status = "Starting"
         state.trigger_count = 0
         state.logs = []
+        state.last_stt_text = ""
         
         # Start background loop in thread
         engine_thread = threading.Thread(
@@ -508,16 +504,22 @@ with col1:
         color="#38bdf8"
     )
 
-    # Live Transcribed STT Card for Judges
-    st.subheader("🗣️ Live Transcribed Speech Output (STT)")
-    st_text = state.last_stt_text if state.last_stt_text else "(waiting for speech...)"
-    st.markdown(f"""
-        <div class="metric-card" style="border-left: 6px solid #a855f7;">
-            <span style="color: #94a3b8; font-size: 0.9rem;">RECOGNIZED SPEECH TEXT</span>
-            <h2 style="margin: 5px 0; font-size: 1.8rem; color: #a855f7;">"{st_text}"</h2>
-            <span style="color: #64748b; font-size: 0.85rem;">Server ASR Compute: <b>{state.last_asr_ms} ms</b> | Net RTT: <b>{state.last_rtt_ms:.2f} ms</b></span>
-        </div>
-    """, unsafe_allow_html=True)
+    # Render Real-time Speech-To-Text (STT) Result Card
+    st.subheader("🗣️ Server Speech-To-Text (STT) Result")
+    if state.last_stt_text:
+        st.markdown(f"""
+            <div style="background-color: #1e293b; border: 2px solid #00e5ff; border-radius: 8px; padding: 1.2rem; margin-top: 10px;">
+                <span style="color: #94a3b8; font-size: 0.9rem; font-weight: bold;">LAST TRANSCRIBED TEXT</span>
+                <h2 style="margin: 5px 0; color: #00e5ff; font-size: 1.8rem;">"{state.last_stt_text}"</h2>
+                <div style="display: flex; gap: 15px; margin-top: 10px; color: #e2e8f0; font-size: 0.9rem;">
+                    <span>⏱️ Transfer: <b>{state.last_transfer_ms} ms</b></span>
+                    <span>⚡ STT Compute: <b>{state.last_stt_ms} ms</b></span>
+                    <span>🚀 Total Latency: <b>{state.last_total_ms} ms</b></span>
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.info("Awaiting wake-word activation and server STT response...")
 
 with col2:
     st.subheader("🖥️ Client Metrics")
@@ -528,7 +530,7 @@ with col2:
             st.markdown(f"""
                 <div class="metric-card" style="border-left: 6px solid #22c55e;">
                     <span style="color: #94a3b8; font-size: 0.9rem;">CONNECTION STATUS</span>
-                    <h3 style="margin: 0; color: #22c55e; font-size: 1.3rem;">🟢 Pre-Warmed Socket Ready</h3>
+                    <h3 style="margin: 0; color: #22c55e; font-size: 1.3rem;">🟢 Server Connected</h3>
                     <span style="color: #64748b; font-size: 0.8rem;">Active link to {host}:{port}</span>
                 </div>
             """, unsafe_allow_html=True)

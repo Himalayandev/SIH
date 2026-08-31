@@ -5,5 +5,13 @@ echo =========================================================================
 echo 🚀 STARTING SIH LOW-LATENCY ASR SERVER & SECURITY CONSOLE...
 echo =========================================================================
 cd /d "%~dp0"
-venv\Scripts\python.exe infinix_laptop_server\live_server_console.py
+if exist venv\Scripts\python.exe (
+    venv\Scripts\python.exe infinix_laptop_server\live_server_console.py
+) else (
+    python infinix_laptop_server\live_server_console.py
+)
+if errorlevel 1 (
+    python3 infinix_laptop_server\live_server_console.py
+)
 pause
+

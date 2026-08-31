@@ -52,6 +52,7 @@ COMPUTE_TYPE = "int8"
 CPU_THREADS = 4
 BEAM_SIZE = 1
 
+cfg = {}
 if os.path.exists(CONFIG_PATH):
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -103,6 +104,15 @@ else:
     log_msg("⚠️ faster-whisper not installed. Running in high-speed simulation mode.")
 log_msg("=" * 60)
 
+def recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
 def handle_esp32_connection(client_sock, client_addr):
     client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     client_sock.settimeout(60.0) # Persistent pre-warmed idle connection timeout
@@ -115,10 +125,8 @@ def handle_esp32_connection(client_sock, client_addr):
 
         while True:
             try:
-                opcode_byte = client_sock.recv(1)
-            except socket.timeout:
-                break
-            except Exception:
+                opcode_byte = recv_exact(client_sock, 1)
+            except (socket.timeout, Exception):
                 break
 
             if not opcode_byte:
@@ -145,18 +153,15 @@ def handle_esp32_connection(client_sock, client_addr):
 
             elif opcode == PROTOCOL_AUDIO_CHUNK:
                 # Length-Prefixed TLV Frame: Read 2-byte N (payload length)
-                len_bytes = client_sock.recv(2)
-                if len(len_bytes) < 2:
+                len_bytes = recv_exact(client_sock, 2)
+                if not len_bytes or len(len_bytes) < 2:
                     break
                 payload_len = struct.unpack("<H", len_bytes)[0]
                 
                 # Read N bytes of raw PCM16 audio
-                chunk_data = b""
-                while len(chunk_data) < payload_len:
-                    more = client_sock.recv(payload_len - len(chunk_data))
-                    if not more:
-                        break
-                    chunk_data += more
+                chunk_data = recv_exact(client_sock, payload_len)
+                if chunk_data is None:
+                    break
                 
                 pcm_chunks.append(chunk_data)
 
